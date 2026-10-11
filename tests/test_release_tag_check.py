@@ -452,15 +452,36 @@ def test_failed_release_lookup_fails_the_job(tmp_path: Path) -> None:
     assert outputs == {}
 
 
+_ENTRY_POINTS = {
+    "workflow_run": "workflow_run_tag",
+    "release": "event_release_tag",
+    "workflow_dispatch": "latest",
+}
+
+
 @_needs_bash
+@pytest.mark.parametrize("entry", sorted(_ENTRY_POINTS))
 @pytest.mark.parametrize("tag", ["v0.15.0.dev0", "v0.15.0rc1.dev2"])
-def test_dev_tag_released_as_final_fails_the_job(tmp_path: Path, tag: str) -> None:
+def test_dev_tag_released_as_final_fails_the_job(tmp_path: Path, tag: str, entry: str) -> None:
     """A commit from before the tag check, or a release made by hand, can
-    leave a dev release marked final; its name alone keeps it off the registry."""
-    proc, outputs, _ = _run_resolve(tmp_path, workflow_run_tag=tag)
+    leave a dev release marked final; its name alone keeps it off the registry,
+    however the workflow was started."""
+    proc, outputs, _ = _run_resolve(tmp_path, **{_ENTRY_POINTS[entry]: tag})
     assert proc.returncode != 0
     assert outputs == {}
     assert "development version" in proc.stderr
+
+
+@_needs_bash
+@pytest.mark.parametrize("entry", sorted(_ENTRY_POINTS))
+def test_final_named_tag_marked_prerelease_skips_the_registry(tmp_path: Path, entry: str) -> None:
+    """The name check only ever adds a skip: a release whose name looks final
+    but which GitHub marks as a pre-release is still kept off the registry."""
+    proc, outputs, _ = _run_resolve(
+        tmp_path, prereleases=("v0.16.0",), **{_ENTRY_POINTS[entry]: "v0.16.0"}
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert outputs == {"tag": "v0.16.0", "prerelease": "true"}
 
 
 @_needs_bash
