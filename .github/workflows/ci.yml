@@ -12,13 +12,22 @@ on:
 permissions:
   contents: read
 
+# A new push to a PR supersedes its running checks, so only PR runs cancel
+# each other. Every other run gets a group of its own: pushes to `main` and
+# `dev`, tag pushes and dispatches can share a commit, and a group keyed on
+# the commit would let one of them silently cancel another's pending run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   PYTHON_VERSION: "3.11"
 
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
@@ -36,7 +45,8 @@ jobs:
 
   architecture:
     name: Architecture Checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
@@ -56,7 +66,8 @@ jobs:
 
   test:
     name: Tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
 
     strategy:
       fail-fast: false
@@ -101,7 +112,8 @@ jobs:
 
   benchmark-smoke:
     name: Benchmark Smoke
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     needs: [architecture]
 
     steps:
@@ -122,7 +134,8 @@ jobs:
 
   benchmark-regression:
     name: Benchmark Regression
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
@@ -145,7 +158,8 @@ jobs:
 
   tla-check:
     name: TLA+ Model Check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
@@ -160,7 +174,8 @@ jobs:
 
   protocol-corpus:
     name: Protocol Corpus (Python ↔ Node parity)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     needs: [architecture]
 
     steps:
@@ -170,10 +185,6 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
-        with:
-          node-version: "20"
 
       - name: Install library + dev dependencies
         run: |
@@ -284,6 +295,15 @@ jobs:
           ref: ${{ steps.plugin_ref.outputs.ref }}
           path: _plugin_checkout
 
+      # After the plugin checkout, so its lockfile exists to key the npm
+      # cache on. Node 22 because the plugin's `engines` require it (on 20,
+      # `npm ci` warns EBADENGINE).
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: _plugin_checkout/package-lock.json
+
       - name: Build Node coordinator
         working-directory: _plugin_checkout
         run: |
@@ -297,7 +317,8 @@ jobs:
 
   build:
     name: Build Package
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     needs: [lint, architecture, test, benchmark-smoke, benchmark-regression, tla-check]
 
     steps:
