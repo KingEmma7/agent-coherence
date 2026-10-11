@@ -95,7 +95,7 @@ stale-write-guard-fs = "ccs.mcp.server:main"
 # package-data replay against the real thing. Neither a modern venv nor
 # GitHub's setup-python leaves it importable on 3.12, so without this the
 # cross-check silently skips everywhere and the pin never actually holds.
-dev = ["pytest>=7.0", "ruff>=0.4", "setuptools>=68.0"]
+dev = ["pytest>=7.0", "pytest-xdist>=3.8", "pytest-split>=0.11", "ruff>=0.4", "setuptools>=68.0"]
 # The packaged conformance corpus (ccs.testing.substrate_conformance) imports
 # and runs WITHOUT pytest; this extra adds it so scenario skips report as
 # skips when a foreign implementation runs the corpus under its test suite.
