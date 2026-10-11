@@ -7,11 +7,21 @@ Every other job in ci.yml lists this job in ``needs`` and reads its outputs.
 The rule for those outputs is fail-open: a consumer skips work only when a
 job condition sees both the right event and an explicit value, so an empty or
 missing output means "run". This script therefore writes every key on every
-run, writes it empty when it cannot decide, and always exits 0 — a plan job
-that failed would hand its consumers to GitHub's cascade-skip rules.
+run, writes a key's run-everything value when it cannot decide it, and always
+exits 0: a plan job that failed would hand its consumers to GitHub's
+cascade-skip rules.
 
-Outputs, appended to ``$GITHUB_OUTPUT``:
-    tested-tree   the tree id of the checked-out commit (what this run tests)
+Outputs, appended to ``$GITHUB_OUTPUT``, each with its run-everything value
+when it cannot be decided:
+    tested-tree   the tree id of the checked-out commit (what this run tests);
+                  empty when unknown
+    tla-needed    ``false`` only on a pull request whose changes touch no TLA+
+                  input (anything under formal/tla/, the Makefile, anything
+                  under .github/); ``true`` on every other event, on an empty
+                  or failed diff, and when unknown
+
+On ``pull_request`` the checkout is the merge commit at depth 2, so its first
+parent is the base: the diff between them is exactly what the PR changes.
 
 Runs on the runner's system Python with no setup step, from the repository
 root: ``python3 tools/ci_plan.py``.
@@ -23,7 +33,12 @@ import os
 import subprocess
 import sys
 
-OUTPUT_KEYS = ("tested-tree",)
+OUTPUT_KEYS = ("tested-tree", "tla-needed")
+# What each output says when it cannot be decided: "run everything".
+FALLBACKS = {"tested-tree": "", "tla-needed": "true"}
+# Specs extend each other, so the whole directory is one input.
+TLA_INPUT_PREFIXES = ("formal/tla/", ".github/")
+TLA_INPUT_FILES = ("Makefile",)
 
 
 def tested_tree() -> str:
@@ -33,8 +48,29 @@ def tested_tree() -> str:
     return result.stdout.strip()
 
 
-def plan() -> dict[str, str]:
-    return {"tested-tree": tested_tree()}
+def changed_paths() -> list[str]:
+    """Paths the checked-out merge commit changes against its first parent (the base)."""
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD^1", "HEAD"], capture_output=True, text=True, timeout=30, check=True
+    )
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def is_tla_input(path: str) -> bool:
+    return path in TLA_INPUT_FILES or path.startswith(TLA_INPUT_PREFIXES)
+
+
+def tla_needed() -> str:
+    if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
+        return "true"
+    changed = changed_paths()
+    # A diff that misfires can exit zero with no output: an empty list proves nothing.
+    if not changed:
+        return "true"
+    return "true" if any(is_tla_input(path) for path in changed) else "false"
+
+
+DECISIONS = {"tested-tree": tested_tree, "tla-needed": tla_needed}
 
 
 def write_outputs(outputs: dict[str, str]) -> None:
@@ -46,15 +82,18 @@ def write_outputs(outputs: dict[str, str]) -> None:
     print(lines, end="")
 
 
-def main() -> int:
-    outputs = {key: "" for key in OUTPUT_KEYS}
+def decide(key: str) -> str:
     try:
-        outputs.update(plan())
-    # Fail open by design: any error leaves every output empty, which every
-    # consumer reads as "run everything".
+        return DECISIONS[key]()
+    # Fail open by design: an output that cannot be decided takes its
+    # run-everything value, and the other outputs are still decided.
     except Exception as exc:  # noqa: BLE001
-        print(f"plan: could not decide ({type(exc).__name__}: {exc}); every check runs", file=sys.stderr)
-    write_outputs(outputs)
+        print(f"plan: could not decide {key} ({type(exc).__name__}: {exc}); it runs", file=sys.stderr)
+        return FALLBACKS[key]
+
+
+def main() -> int:
+    write_outputs({key: decide(key) for key in OUTPUT_KEYS})
     return 0
 
 

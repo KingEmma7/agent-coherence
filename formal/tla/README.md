@@ -82,6 +82,11 @@ formal/tla/
 # All CI-swept specs (recommended)
 make tla-check
 
+# One of the three bins CI runs as parallel jobs (together they are tla-check)
+make tla-check-1   # EffectGate
+make tla-check-2   # Retention, Snapshot, OCC
+make tla-check-3   # Fencing, ZombieRevoke, MESI_Standalone, CrashRecovery, WorkspaceVersion
+
 # Individual models
 java -XX:+UseParallelGC -cp formal/tla/lib/tla2tools.jar tlc2.TLC \
   -config formal/tla/MESI_Standalone.cfg formal/tla/MESI_Standalone.tla -workers auto
@@ -242,8 +247,15 @@ distinct states (5,954,640 → 5,723,640), ZombieRevoke ~6% (3,902,098 → 3,648
 EffectGate ~4% (10.5M → 10,036,000) and Snapshot ~21% (1,735,500 → 1,363,115). The
 action property adds a per-transition check and no state dimension. The full
 `make tla-check` sweep measured **~11min09s** (669s) on that run; the 5-minute target
-above is historical and the workflow sets no job timeout, so this table is the only
-operational meaning "the CI budget" has.
+above is historical.
+
+Since 2026-10, CI does not run the sweep in one job. It runs the three Makefile bins
+(`tla-check-1`..`3`, same specs and configs) as parallel jobs, each capped at 20 minutes;
+each took about 4.5 minutes on a slow GitHub runner when the bins were drawn. A pull
+request that changes nothing under `formal/tla/`, the `Makefile` or `.github/` skips
+them, and every other run runs all three. When a spec's time moves, rebalance the bins
+so the slowest stays near the others; `make tla-check` stays the local, sequential way
+to run everything.
 
 Retention's distinct-state count **equals** Fencing's by design: the retained history is a
 deterministic function of the version window (content abstracted as the version number)
