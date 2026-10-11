@@ -1,7 +1,8 @@
 # Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
-"""Pytest configuration: defensive collection-skip for optional-extra tests.
+"""Pytest configuration: collection guards, the shared ``registry`` fixture,
+and the lanes CI splits the suite into.
 
 `tests/test_diagnose_*.py` import the public surface of ``ccs.diagnose``,
 which transitively imports ``langchain_core`` and ``langgraph`` (declared
@@ -12,6 +13,17 @@ during collection.
 CI installs ``.[dev,diagnose]`` so all diagnose tests run. This guard is
 the second layer of defense for local installs and for any future CI
 matrix that exercises bare-install paths.
+
+Lanes: CI runs each Python version as several shards (pytest-split), and
+each shard as two lanes. ``--test-lane parallel`` keeps every test not
+marked ``serial`` and runs on several xdist workers; ``--test-lane serial``
+keeps only ``serial`` tests and runs with ``-n 0``. The lane is a command-line
+option, never ``-m``: a command-line ``-m`` replaces the ``addopts``
+exclusions instead of adding to them. ``--node-id-dir=DIR`` makes the run write
+the lists a CI gate checks to prove every test ran exactly once
+(``tools/check_shard_coverage.py``); give it with ``=``, because pytest reads
+an existing DIR passed as a separate argument as a test path before this
+conftest is loaded. With neither option, nothing changes.
 """
 
 from __future__ import annotations
@@ -20,6 +32,9 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+
+SERIAL_MARKER = "serial"
+LANES = ("parallel", "serial")
 
 collect_ignore_glob: list[str] = []
 
@@ -50,6 +65,85 @@ def _mcp_server_available() -> bool:
 # job installs `.[...,mcp]` so it runs there.
 if not _mcp_server_available():
     collect_ignore_glob.append("test_mcp_front_door_demo.py")
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    group = parser.getgroup("lanes", "CI lanes (see tests/conftest.py)")
+    group.addoption(
+        "--test-lane",
+        choices=LANES,
+        default=None,
+        help="Run only the tests of one lane: 'parallel' (not marked serial) or 'serial'.",
+    )
+    group.addoption(
+        "--node-id-dir",
+        default=None,
+        help=(
+            "Write this run's collected and selected node ids to <lane>-full.txt and <lane>-split.txt in DIR. "
+            "Pass it as --node-id-dir=DIR: an existing DIR given as a separate argument is taken for a test path "
+            "before this conftest loads, and the option is then rejected."
+        ),
+    )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Keep the chosen lane, then record it as the lane's full list.
+
+    ``trylast`` places this after the ``-m`` deselection and before
+    pytest-split, whose own ``trylast`` hook is registered later (in
+    ``pytest_configure``) and so runs after this one: the full list is the
+    lane after the ``addopts`` exclusions and before splitting."""
+    lane = config.getoption("test_lane")
+    if lane is not None:
+        want_serial = lane == SERIAL_MARKER
+        kept: list[pytest.Item] = []
+        dropped: list[pytest.Item] = []
+        for item in items:
+            in_lane = (item.get_closest_marker(SERIAL_MARKER) is not None) == want_serial
+            (kept if in_lane else dropped).append(item)
+        if dropped:
+            config.hook.pytest_deselected(items=dropped)
+            items[:] = kept
+    _write_node_ids(config, "full", items)
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Record what this run selected, after pytest-split chose its group."""
+    _write_node_ids(session.config, "split", session.items)
+
+
+def _write_node_ids(config: pytest.Config, kind: str, items: list[pytest.Item]) -> None:
+    directory = config.getoption("node_id_dir")
+    if directory is None or _is_secondary_xdist_worker(config):
+        return
+    path = Path(directory) / f"{config.getoption('test_lane') or 'all'}-{kind}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Exclusive create: a second writer for one list is a bug in this hook,
+    # and the run should fail rather than let it overwrite the evidence.
+    with path.open("x") as out:
+        out.writelines(f"{item.nodeid}\n" for item in items)
+
+
+def _is_secondary_xdist_worker(config: pytest.Config) -> bool:
+    """Every xdist worker collects the same items; only ``gw0`` writes them.
+    The controller collects nothing, so it never reaches the writer."""
+    workerinput = getattr(config, "workerinput", None)
+    return workerinput is not None and workerinput["workerid"] != "gw0"
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """A shard whose split selects no tests for a lane has run correctly; the
+    gate's coverage check, not pytest's exit 5, decides whether the shards
+    together covered the lane (it fails on an empty full list)."""
+    config = session.config
+    if (
+        exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED
+        and config.getoption("test_lane") is not None
+        and getattr(config.option, "splits", None)
+    ):
+        session.exitstatus = pytest.ExitCode.OK
 
 
 def pytest_configure(config):

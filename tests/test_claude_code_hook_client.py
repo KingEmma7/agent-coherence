@@ -828,6 +828,8 @@ def test_hook_client_claims_once_per_session_and_presents_the_stored_principal(
     assert server.registry.last_writer_for(artifact_id) == session_to_agent_id(sid, "sub-1")
 
 
+# Racing hook processes: run with -n 0 (tests/conftest.py).
+@pytest.mark.serial
 def test_racing_hook_processes_for_a_new_session_bind_one_principal(inproc_coordinator) -> None:
     """Two hook processes starting together for an unclaimed session produce
     ONE binding: the loser of the exclusive nonce create adopts the winner's

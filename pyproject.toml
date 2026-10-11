@@ -143,11 +143,15 @@ markers = [
     "protocol_corpus: Cross-implementation wire-shape parity corpus. Spawns Python + Node coordinators against shared JSON fixtures. Requires the agent-coherence-plugin checkout built (`npm ci && npm run build`) or `AGENT_COHERENCE_PLUGIN_DIST_PATH` set; Node scenarios xfail with a clear reason if the dist path can't resolve. Run via `pytest -m protocol_corpus`.",
     "live_api: OpenAI/Mistral Conversations live-API tests (stale-read probe + adapter smoke). Requires OPENAI_API_KEY and/or MISTRAL_API_KEY and the `[openai,mistral]` extras; ~$10 per full probe run. Excluded from default `pytest -q`. Run via `pytest -m live_api`.",
     "real_substrate: BYO-substrate conformance against a REAL Postgres / S3 (no Moto/LocalStack — they serialize and false-green concurrency). Requires the `[coherent-row]`/`[coherent-object]` extras plus credentials (CCS_TEST_PG_DSN, CCS_REAL_S3_BUCKET, etc.). Excluded from default `pytest -q`. Run via `pytest -m real_substrate`.",
+    "serial: Not safe beside other xdist workers (real processes that race each other). CI runs these in the serial lane with -n 0; see tests/conftest.py.",
 ]
 # Skip launch_gate + protocol_corpus + live_api + real_substrate markers in
 # default unit test runs. live_api / real_substrate need credentials and real
 # backends; keep them opt-in so the normal `pytest -q` loop stays fast, offline,
 # and free.
+# Dump every thread's stack when one test runs this long, so a hung xdist
+# worker leaves a traceback in the CI log instead of only a job timeout.
+faulthandler_timeout = 300
 addopts = "-m 'not launch_gate and not launch_gate_pilot and not launch_gate_strict and not launch_gate_pilot_matrix and not protocol_corpus and not live_api and not real_substrate'"
 
 [tool.setuptools]
