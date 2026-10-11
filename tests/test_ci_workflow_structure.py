@@ -184,3 +184,122 @@ def test_every_needs_reference_is_declared() -> None:
                 if output is not None:
                     declared = jobs[needed].get("outputs") or {}
                     assert output in declared, f"{name} reads undeclared {needed}.outputs.{output}"
+
+
+# The names `dev`'s branch protection requires. Frozen on purpose (tests/CLAUDE.md):
+# a job renamed in ci.yml leaves its required check pending forever, so the
+# rename has to be a deliberate edit here too.
+REQUIRED_CHECKS = frozenset(
+    {
+        "Lint",
+        "Architecture Checks",
+        "Tests (Python 3.11)",
+        "Tests (Python 3.12)",
+        "Benchmark Smoke",
+        "Benchmark Regression",
+        "TLA+ Model Check",
+        "Protocol Corpus (Python ↔ Node parity)",
+        "Build Package",
+    }
+)
+REQUIRED_CHECK_COUNT = 9
+TEST_GATES = {"tests-py311": "test-shards-py311", "tests-py312": "test-shards-py312"}
+OTHER_WORKFLOWS = ("publish-mcp.yml", "release.yml")
+
+
+def _job_names() -> dict[str, str]:
+    return {job_id: job.get("name", job_id) for job_id, job in _jobs().items()}
+
+
+def test_every_required_check_is_one_non_matrix_job() -> None:
+    """A required name on a matrix job that GitHub skips as a whole renders
+    unexpanded and never reports; a required name on two jobs is ambiguous."""
+    assert len(REQUIRED_CHECKS) == REQUIRED_CHECK_COUNT
+    names = list(_job_names().values())
+    for check in REQUIRED_CHECKS:
+        assert names.count(check) == 1, f"{check!r} names {names.count(check)} jobs"
+    jobs = _jobs()
+    for job_id, name in _job_names().items():
+        if name in REQUIRED_CHECKS:
+            assert "strategy" not in jobs[job_id], f"required check {name!r} is a matrix job"
+    for workflow in OTHER_WORKFLOWS:
+        other = yaml.safe_load((CI_WORKFLOW.parent / workflow).read_text())
+        other_names = {job.get("name", job_id) for job_id, job in other["jobs"].items()}
+        assert not other_names & REQUIRED_CHECKS, f"{workflow} reuses a required name"
+
+
+def test_the_corpus_needs_nothing_and_build_and_smoke_need_only_the_plan() -> None:
+    """A needed job that is skipped or failed cascades; the corpus must run
+    whatever else happens, and Build Package no longer waits on the long jobs."""
+    jobs = _jobs()
+    assert "needs" not in jobs["protocol-corpus"]
+    assert _needs(jobs["build"]) == ["plan"]
+    assert _needs(jobs["benchmark-smoke"]) == ["plan"]
+
+
+def test_plan_consumers_run_unless_cancelled() -> None:
+    """A plan job that died must not cascade-skip its consumers: a skipped
+    required check would read as passing."""
+    for job_id, job in _jobs().items():
+        if "plan" in _needs(job):
+            assert job.get("if") == "${{ !cancelled() }}", f"{job_id} would cascade-skip on a dead plan job"
+
+
+def test_the_test_gates_always_run_and_judge_their_shards() -> None:
+    """A gate skipped or cancelled with its run would leave the required check
+    in a state GitHub might count as passing; under always() it reports, and
+    its verdict reads its own shards' result."""
+    jobs = _jobs()
+    for gate, shards in TEST_GATES.items():
+        job = jobs[gate]
+        assert job["if"] == "${{ always() }}"
+        assert _needs(job) == [shards]
+        run_text = "\n".join(_strings(job))
+        assert f"needs.{shards}.result" in run_text
+        assert '--shards "$TEST_SHARD_COUNT"' in run_text
+
+
+def _shard_steps(job_id: str) -> list[dict[str, Any]]:
+    return _jobs()[job_id]["steps"]
+
+
+def test_both_python_legs_run_identical_shards() -> None:
+    """The legs must differ only in the Python version; a step that exists in
+    one leg would silently check less in the other."""
+    py311 = yaml.safe_dump(_jobs()["test-shards-py311"]).replace("3.11", "X")
+    py312 = yaml.safe_dump(_jobs()["test-shards-py312"]).replace("3.12", "X")
+    assert py311 == py312
+
+
+def test_the_shard_matrix_matches_the_shard_count() -> None:
+    """pytest-split's --splits, the matrix and the gate's --shards must agree,
+    or a group would never run and the coverage check would see too few shards."""
+    count = int(_workflow()["env"]["TEST_SHARD_COUNT"])
+    for job_id in TEST_GATES.values():
+        assert _jobs()[job_id]["strategy"]["matrix"]["shard"] == list(range(1, count + 1))
+
+
+def _step(job_id: str, name: str) -> dict[str, Any]:
+    steps = [step for step in _shard_steps(job_id) if step.get("name") == name]
+    assert len(steps) == 1, f"{job_id} has {len(steps)} {name!r} steps"
+    return steps[0]
+
+
+def test_the_lanes_run_as_tests_conftest_expects() -> None:
+    """The lane is a command-line option, never `-m` (which would replace the
+    addopts exclusions); the serial lane runs without workers and still runs
+    after a parallel-lane failure; the node-id directory is one argument, or
+    pytest takes the existing directory for a test path; the upload survives
+    a failed or cancelled shard so the gate can see what happened."""
+    for job_id in TEST_GATES.values():
+        parallel = _step(job_id, "Run the parallel lane")
+        serial = _step(job_id, "Run the serial lane")
+        upload = _step(job_id, "Upload node-id lists and test reports")
+        assert "-n 4 --dist worksteal --test-lane parallel" in parallel["run"]
+        assert "-n 0 --test-lane serial" in serial["run"]
+        assert serial["if"] == "${{ !cancelled() }}"
+        assert upload["if"] == "${{ always() }}"
+        for step in (parallel, serial):
+            assert " -m " not in f" {step['run']} "
+            assert '"--node-id-dir=lists/shard-$SHARD"' in step["run"]
+            assert "--durations-path tests/.test_durations" in step["run"]
