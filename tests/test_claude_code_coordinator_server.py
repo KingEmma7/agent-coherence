@@ -12963,6 +12963,7 @@ def test_status_answers_a_marked_degraded_body_in_time_while_the_registry_lock_i
     assert degraded["degraded"] is True
     assert degraded["tracked_artifacts"] is None and degraded["sessions"] is None
     assert set(degraded) == set(normal) | {"degraded"}
+    assert degraded["registry_schema_version"] == normal["registry_schema_version"]
     assert degraded["detail"] == normal["detail"]
     assert degraded["coordinator_root"] == normal["coordinator_root"]
     assert degraded["policy_summary"] == normal["policy_summary"]
