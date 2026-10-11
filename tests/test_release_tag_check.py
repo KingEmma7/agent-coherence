@@ -453,6 +453,36 @@ def test_failed_release_lookup_fails_the_job(tmp_path: Path) -> None:
 
 
 @_needs_bash
+@pytest.mark.parametrize("tag", ["v0.15.0.dev0", "v0.15.0rc1.dev2"])
+def test_dev_tag_released_as_final_fails_the_job(tmp_path: Path, tag: str) -> None:
+    """A commit from before the tag check, or a release made by hand, can
+    leave a dev release marked final; its name alone keeps it off the registry."""
+    proc, outputs, _ = _run_resolve(tmp_path, workflow_run_tag=tag)
+    assert proc.returncode != 0
+    assert outputs == {}
+    assert "development version" in proc.stderr
+
+
+@_needs_bash
+@pytest.mark.parametrize("tag", ["v0.15.0rc1", "v0.15.0a1", "v0.15.0-rc1"])
+def test_prerelease_named_tag_released_as_final_skips_the_registry(
+    tmp_path: Path, tag: str
+) -> None:
+    proc, outputs, _ = _run_resolve(tmp_path, event_release_tag=tag)
+    assert proc.returncode == 0, proc.stderr
+    assert outputs == {"tag": tag, "prerelease": "true"}
+    assert "not publishing it to the MCP Registry" in proc.stdout
+
+
+@_needs_bash
+@pytest.mark.parametrize("tag", ["v0.15.0", "v0.8.4.1", "v0.15.0.post1"])
+def test_final_named_tag_released_as_final_publishes(tmp_path: Path, tag: str) -> None:
+    proc, outputs, _ = _run_resolve(tmp_path, workflow_run_tag=tag)
+    assert proc.returncode == 0, proc.stderr
+    assert outputs == {"tag": tag, "prerelease": "false"}
+
+
+@_needs_bash
 @pytest.mark.skipif(shutil.which("jq") is None, reason="the step runs jq, as on the runner")
 def test_sync_step_writes_the_tag_version_into_both_server_json_fields(tmp_path: Path) -> None:
     """The registry refuses a version it already holds, so both fields must move."""

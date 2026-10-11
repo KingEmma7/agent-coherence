@@ -59,7 +59,11 @@ jobs:
       # final release after a pre-release run.
       #
       # Pre-releases (release.yml marks aN / bN / rcN as such) stay off the
-      # registry: the steps below are skipped for them.
+      # registry: the steps below are skipped for them. The tag's own name is
+      # checked as well as the flag, because only the tagged commit's
+      # release.yml sets the flag: an older commit's release.yml, or a release
+      # made by hand without the box ticked, leaves it false. A dev version
+      # fails the job, and any name but a plain final version is skipped.
       - name: Resolve the released tag
         id: release
         env:
@@ -71,10 +75,18 @@ jobs:
           if [ -z "$tag" ]; then
             tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
           fi
+          case "$tag" in
+            *dev*)
+              echo "$tag names a development version; it is never published to the MCP Registry" >&2
+              exit 1 ;;
+          esac
           prerelease="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)"
           if [ "$prerelease" != "true" ] && [ "$prerelease" != "false" ]; then
             echo "Could not tell whether $tag is a pre-release (got '$prerelease')" >&2
             exit 1
+          fi
+          if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+(\.[0-9]+)*(\.post[0-9]+)?$'; then
+            prerelease=true
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"

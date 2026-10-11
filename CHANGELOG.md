@@ -804,7 +804,10 @@ Alpha — APIs may change before `v1.0`.
   registry workflow now publishes the tag that started the release run, not
   whichever release GitHub lists as latest. It acts only on a release run
   started by a tag push in this repository, so a run from a fork cannot choose
-  the tag.
+  the tag. It also reads the tag's name, so a release left marked final by an
+  older commit's workflow or by hand still stays off the registry: a
+  development version fails the job, and any name but a plain final version is
+  skipped.
 
 - **Opening a store the Node coordinator created no longer points you at a
   switch that does not exist.** The `CrossRuntimeSchemaError` raised for a
