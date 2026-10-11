@@ -611,7 +611,6 @@ def coordinator(tmp_path: Path):
 
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
     server.serve_in_thread()
-    time.sleep(0.05)
     try:
         yield server
     finally:

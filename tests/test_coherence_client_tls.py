@@ -404,14 +404,14 @@ def _start_tls_server(
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     srv.socket = sctx.wrap_socket(srv.socket, server_side=True)
     port = srv.socket.getsockname()[1]
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     return _RunningServer(port=port, handler_cls=handler_cls, _server=srv)
 
 
 def _start_plain_server(handler_cls: type[_RecordingHandler]) -> _RunningServer:
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     port = srv.socket.getsockname()[1]
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     return _RunningServer(port=port, handler_cls=handler_cls, _server=srv)
 
 
@@ -575,7 +575,7 @@ class TestRedirectRefusal:
         scoped = type("_ScopedPlain", (_PlainHandler,), {"seen": [], "status": code})
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), scoped)
         port = srv.socket.getsockname()[1]
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         try:
             ep = CoordinatorEndpoint(port=port, bearer="s3cr3t", host="127.0.0.1")
             with pytest.raises(RedirectRefused):
@@ -675,7 +675,7 @@ class TestLoopbackHttpUnchanged:
 
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         port = srv.socket.getsockname()[1]
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         try:
             ep = CoordinatorEndpoint(port=port, bearer="deadbeef", host="127.0.0.1")
             assert ep.scheme == "http"

@@ -127,7 +127,7 @@ def scripted(tmp_path: Path):
     coherence = tmp_path / ".coherence"
     coherence.mkdir(mode=0o700)
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _Scripted)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     (coherence / "server.pid").write_text(f"12345\n{httpd.server_address[1]}\n")
     (coherence / "hook.secret").write_text("test-secret")
     sid = _sid()
@@ -621,7 +621,6 @@ def test_the_watchdog_claim_reason_is_the_coordinators() -> None:
 def _start(workspace: Path) -> CoordinatorHTTPServer:
     server = CoordinatorHTTPServer(workspace, port=0, instance_id="principal-recovery")
     server.serve_in_thread()
-    time.sleep(0.05)
     (workspace / ".coherence" / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
     return server
 
@@ -1650,7 +1649,7 @@ def test_the_self_test_reports_a_failed_step_by_status_and_known_tokens_only(
     _EchoCoordinator.echo_at, _EchoCoordinator.pre_reads = echo_at, 0
     _EchoCoordinator.nonces, _EchoCoordinator.principals = [], []
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _EchoCoordinator)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     (workspace / ".coherence").mkdir(mode=0o700)
     (workspace / ".coherence" / "server.pid").write_text(f"12345\n{httpd.server_address[1]}\n")
     (workspace / ".coherence" / "hook.secret").write_text("test-secret")
