@@ -430,9 +430,13 @@ def test_release_event_for_a_prerelease_skips_the_registry(tmp_path: Path) -> No
 
 @_needs_bash
 def test_manual_dispatch_publishes_the_latest_release(tmp_path: Path) -> None:
-    proc, outputs, _ = _run_resolve(tmp_path, latest="v0.14.1")
+    proc, outputs, gh_log = _run_resolve(tmp_path, latest="v0.14.1")
     assert proc.returncode == 0, proc.stderr
     assert outputs == {"tag": "v0.14.1", "prerelease": "false"}
+    # The stub ignores -q, so the lookup's query is pinned here.
+    assert "release view --repo example/agent-coherence --json tagName -q .tagName" in (
+        gh_log.splitlines()
+    )
 
 
 @_needs_bash
@@ -461,7 +465,7 @@ _ENTRY_POINTS = {
 
 @_needs_bash
 @pytest.mark.parametrize("entry", sorted(_ENTRY_POINTS))
-@pytest.mark.parametrize("tag", ["v0.15.0.dev0", "v0.15.0rc1.dev2"])
+@pytest.mark.parametrize("tag", ["v0.15.0.dev0", "v0.15.0rc1.dev2", "v0.15.0dev0"])
 def test_dev_tag_released_as_final_fails_the_job(tmp_path: Path, tag: str, entry: str) -> None:
     """A commit from before the tag check, or a release made by hand, can
     leave a dev release marked final; its name alone keeps it off the registry,
@@ -477,19 +481,29 @@ def test_dev_tag_released_as_final_fails_the_job(tmp_path: Path, tag: str, entry
 def test_final_named_tag_marked_prerelease_skips_the_registry(tmp_path: Path, entry: str) -> None:
     """The name check only ever adds a skip: a release whose name looks final
     but which GitHub marks as a pre-release is still kept off the registry."""
-    proc, outputs, _ = _run_resolve(
+    proc, outputs, gh_log = _run_resolve(
         tmp_path, prereleases=("v0.16.0",), **{_ENTRY_POINTS[entry]: "v0.16.0"}
     )
     assert proc.returncode == 0, proc.stderr
     assert outputs == {"tag": "v0.16.0", "prerelease": "true"}
+    # The stub answers by field and ignores -q, so the query itself is pinned
+    # here: a jq expression that always yields a boolean would pass the
+    # true/false guard and drop the flag.
+    assert (
+        "release view v0.16.0 --repo example/agent-coherence --json isPrerelease -q .isPrerelease"
+        in gh_log.splitlines()
+    )
 
 
 @_needs_bash
-@pytest.mark.parametrize("tag", ["v0.15.0rc1", "v0.15.0a1", "v0.15.0-rc1"])
+@pytest.mark.parametrize("entry", sorted(_ENTRY_POINTS))
+@pytest.mark.parametrize(
+    "tag", ["v0.15.0rc1", "v0.15.0a1", "v0.15.0b1", "v0.15.0-rc1", "v0.15.0rc1v1"]
+)
 def test_prerelease_named_tag_released_as_final_skips_the_registry(
-    tmp_path: Path, tag: str
+    tmp_path: Path, tag: str, entry: str
 ) -> None:
-    proc, outputs, _ = _run_resolve(tmp_path, event_release_tag=tag)
+    proc, outputs, _ = _run_resolve(tmp_path, **{_ENTRY_POINTS[entry]: tag})
     assert proc.returncode == 0, proc.stderr
     assert outputs == {"tag": tag, "prerelease": "true"}
     assert "not publishing it to the MCP Registry" in proc.stdout
