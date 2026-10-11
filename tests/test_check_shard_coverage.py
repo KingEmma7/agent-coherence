@@ -55,12 +55,14 @@ def _write_ids(path: Path, node_ids: list[str]) -> None:
 def _build(
     root: Path, splits: dict[str, dict[str, list[str]]], full: dict[str, list[str]] | None = None
 ) -> None:
-    """Write each shard's full list (the whole lane, same in every shard) and its split list."""
+    """Write each shard's full list (the whole lane, same in every shard), its split list, and a ran list
+    equal to its split (the shard ran what it selected)."""
     full = full or FULL
     for shard, split_by_lane in splits.items():
         for lane in LANES:
             _write_ids(root / shard / f"{lane}-full.txt", full[lane])
             _write_ids(root / shard / f"{lane}-split.txt", split_by_lane[lane])
+            _write_ids(root / shard / f"{lane}-ran.txt", split_by_lane[lane])
 
 
 def _partition() -> dict[str, dict[str, list[str]]]:
@@ -254,6 +256,10 @@ def _empty_parallel_full(root: Path) -> None:
         _write_ids(root / shard / "parallel-full.txt", [])
 
 
+def _remove_parallel_ran(root: Path) -> None:
+    (root / "shard-1" / "parallel-ran.txt").unlink()
+
+
 def _leave_unchanged(root: Path) -> None:
     del root
 
@@ -288,6 +294,12 @@ def _add_third_shard(root: Path) -> None:
             2,
             ("parallel: CANNOT TELL", "full list is empty in every shard"),
             id="empty-full-list",
+        ),
+        pytest.param(
+            _remove_parallel_ran,
+            2,
+            ("parallel: CANNOT TELL", "missing or unreadable: shard-1/parallel-ran.txt"),
+            id="missing-ran-list",
         ),
         pytest.param(_leave_unchanged, 3, ("CANNOT TELL", "found 2 shard directories"), id="fewer-shards"),
         pytest.param(_add_third_shard, 2, ("CANNOT TELL", "found 3 shard directories"), id="more-shards"),
@@ -330,3 +342,29 @@ def test_main_with_no_shard_directory_at_all_exits_cannot_tell(tool, tmp_path, c
     out = capsys.readouterr().out
     assert exit_code == 2
     assert "found 0 shard directories" in out
+
+
+def test_main_with_a_selected_test_that_never_ran_fails_as_not_run(tool, tmp_path, capsys):
+    """xdist can exit 0 with "no tests ran" after a worker dies during collection, leaving a full split list; a
+    gate that read only the selection lists would pass a shard that ran nothing."""
+    _build(tmp_path, _partition())
+    _write_ids(tmp_path / "shard-2" / "parallel-ran.txt", [])
+
+    exit_code = _run(tool, tmp_path)
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert _listed_under(out, "not run") == [f"{PARALLEL[2]} (shard-2)"]
+
+
+def test_main_with_a_test_run_but_not_selected_fails_as_ran_unselected(tool, tmp_path, capsys):
+    """A result for a test the shard never selected means the lists describe a different run than the one that
+    happened, so none of them can be trusted as evidence."""
+    _build(tmp_path, _partition())
+    _write_ids(tmp_path / "shard-1" / "serial-ran.txt", [SERIAL[0], SERIAL[1]])
+
+    exit_code = _run(tool, tmp_path)
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert _listed_under(out, "ran unselected") == [f"{SERIAL[1]} (shard-1)"]

@@ -20,7 +20,8 @@ marked ``serial`` and runs on several xdist workers; ``--test-lane serial``
 keeps only ``serial`` tests and runs with ``-n 0``. The lane is a command-line
 option, never ``-m``: a command-line ``-m`` replaces the ``addopts``
 exclusions instead of adding to them. ``--node-id-dir=DIR`` makes the run write
-the lists a CI gate checks to prove every test ran exactly once
+what each lane collected, what this shard selected and what it ran: the
+lists a CI gate checks to prove every test ran exactly once
 (``tools/check_shard_coverage.py``); give it with ``=``, because pytest reads
 an existing DIR passed as a separate argument as a test path before this
 conftest is loaded. With neither option, nothing changes.
@@ -79,7 +80,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--node-id-dir",
         default=None,
         help=(
-            "Write this run's collected and selected node ids to <lane>-full.txt and <lane>-split.txt in DIR. "
+            "Write this run's collected, selected and run node ids to <lane>-full.txt, <lane>-split.txt and "
+            "<lane>-ran.txt in DIR. "
             "Pass it as --node-id-dir=DIR: an existing DIR given as a separate argument is taken for a test path "
             "before this conftest loads, and the option is then rejected."
         ),
@@ -125,6 +127,47 @@ def _write_node_ids(config: pytest.Config, kind: str, items: list[pytest.Item]) 
         out.writelines(f"{item.nodeid}\n" for item in items)
 
 
+def _reject_serial_lane_on_workers(config: pytest.Config) -> None:
+    if config.getoption("test_lane") == SERIAL_LANE and getattr(config.option, "numprocesses", None) not in (None, 0):
+        raise pytest.UsageError(
+            "--test-lane serial runs with -n 0: its tests start real processes that race each other "
+            "and are not safe beside other workers"
+        )
+
+
+class _RanRecorder:
+    """Writes ``<lane>-ran.txt``: every test that produced a result.
+
+    The collection lists say what a shard selected; this says what it ran.
+    xdist 3.8 exits 0 with "no tests ran" when a worker dies during
+    collection, so a shard can pass with a full split list and nothing run.
+    It lives in the process that receives every report: the xdist
+    controller, or the only process under ``-n 0``."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._ran: list[str] = []
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        # One entry per test: its call, or its setup when the setup skipped
+        # or failed and no call followed.
+        if report.when == "call" or (report.when == "setup" and not report.passed):
+            self._ran.append(report.nodeid)
+
+    def pytest_sessionfinish(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._path.open("x", encoding="utf-8") as out:
+            out.writelines(f"{node_id}\n" for node_id in self._ran)
+
+
+def _register_ran_recorder(config: pytest.Config) -> None:
+    directory = config.getoption("node_id_dir")
+    if directory is None or config.getoption("collectonly") or getattr(config, "workerinput", None) is not None:
+        return
+    path = Path(directory) / f"{config.getoption('test_lane') or 'all'}-ran.txt"
+    config.pluginmanager.register(_RanRecorder(path), "lane-ran-recorder")
+
+
 def _is_secondary_xdist_worker(config: pytest.Config) -> bool:
     """Every xdist worker collects the same items; only ``gw0`` writes them.
     The controller collects nothing, so it never reaches the writer."""
@@ -136,14 +179,24 @@ def _is_secondary_xdist_worker(config: pytest.Config) -> bool:
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """A shard whose split selects no tests for a lane has run correctly; the
     gate's coverage check, not pytest's exit 5, decides whether the shards
-    together covered the lane (it fails on an empty full list)."""
-    config = session.config
-    if (
-        exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED
-        and config.getoption("test_lane") is not None
-        and config.getoption("splits", None)
-    ):
+    together covered the lane (it fails on an empty full list).
+
+    Only on evidence, though: "no tests ran" is also what xdist reports when a
+    worker dies during collection, after ``gw0`` has already written a split
+    full of tests that never ran. So exit 5 becomes 0 only when this shard's
+    split list was written and is empty."""
+    if exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED and _split_was_empty(session.config):
         session.exitstatus = pytest.ExitCode.OK
+
+
+def _split_was_empty(config: pytest.Config) -> bool:
+    directory, lane = config.getoption("node_id_dir"), config.getoption("test_lane")
+    if directory is None or lane is None or not config.getoption("splits", None):
+        return False
+    try:
+        return (Path(directory) / f"{lane}-split.txt").stat().st_size == 0
+    except FileNotFoundError:
+        return False
 
 
 def pytest_configure(config):
@@ -159,6 +212,8 @@ def pytest_configure(config):
     from ccs.coordinator import service as _service
 
     _service._V090_FIRST_USE_WARNED = True
+    _reject_serial_lane_on_workers(config)
+    _register_ran_recorder(config)
 
 
 @pytest.fixture(autouse=True)

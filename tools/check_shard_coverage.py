@@ -11,6 +11,7 @@ gate job reads the node-id lists every shard wrote and checks the partition.
 Input layout (written by tests/conftest.py):
     ROOT/<shard-dir>/<lane>-full.txt    every test the lane collected before splitting
     ROOT/<shard-dir>/<lane>-split.txt   the tests this shard's split selected
+    ROOT/<shard-dir>/<lane>-ran.txt     the tests this shard produced a result for
 for each lane in ("parallel", "serial"). One node id per line; the line is the
 whole id, because parametrized ids carry spaces, brackets and quotes. Blank
 lines are ignored, as is any entry of ROOT that is not a directory.
@@ -22,7 +23,9 @@ Verdicts, per lane:
     exit 1  FAIL         full lists differ between shards (non-deterministic
                          collection); an id in two split lists or twice in one
                          (duplicate); a full-list id in no split (missed); a
-                         split id absent from the full lists (unexpected)
+                         split id absent from the full lists (unexpected); a
+                         shard that did not run exactly what it selected
+                         (not run / ran unselected)
     exit 0  PASS         otherwise; an empty split list is valid as long as the
                          splits together equal the full list
 
@@ -49,17 +52,18 @@ EXIT_PASS = 0
 EXIT_FAIL = 1
 EXIT_CANNOT_TELL = 2
 VERDICT_NAMES = {EXIT_PASS: "PASS", EXIT_FAIL: "FAIL", EXIT_CANNOT_TELL: "CANNOT TELL"}
-LIST_KINDS = ("full", "split")
+LIST_KINDS = ("full", "split", "ran")
 # Enough to start debugging; a broken split can name thousands of ids.
 MAX_NAMED = 20
 
 
 class ShardLane(NamedTuple):
-    """One shard's two lists for one lane."""
+    """One shard's three lists for one lane."""
 
     name: str
     full: list[str]
     split: list[str]
+    ran: list[str]
 
 
 class LaneVerdict(NamedTuple):
@@ -86,7 +90,7 @@ def load_lane(shard_dirs: Sequence[Path], lane: str) -> tuple[list[ShardLane], l
             except (OSError, UnicodeDecodeError) as exc:
                 problems.append(f"{shard_dir.name}/{path.name} ({type(exc).__name__})")
         if len(lists) == len(LIST_KINDS):
-            loaded.append(ShardLane(shard_dir.name, lists["full"], lists["split"]))
+            loaded.append(ShardLane(shard_dir.name, lists["full"], lists["split"], lists["ran"]))
     return loaded, problems
 
 
@@ -107,6 +111,19 @@ def find_duplicates(shards: Sequence[ShardLane]) -> list[str]:
     return [f"{node_id} ({', '.join(names)})" for node_id, names in sorted(owners.items()) if len(names) > 1]
 
 
+def find_run_gaps(shards: Sequence[ShardLane]) -> tuple[list[str], list[str]]:
+    """Selected ids a shard produced no result for, and ids it ran without selecting.
+
+    Selection is not execution: xdist can exit 0 with "no tests ran" after a
+    worker dies during collection, leaving a full split list behind."""
+    not_run: list[str] = []
+    unselected: list[str] = []
+    for shard in shards:
+        not_run += [f"{node_id} ({shard.name})" for node_id in sorted(set(shard.split) - set(shard.ran))]
+        unselected += [f"{node_id} ({shard.name})" for node_id in sorted(set(shard.ran) - set(shard.split))]
+    return not_run, unselected
+
+
 def format_category(title: str, entries: Sequence[str]) -> list[str]:
     lines = [f"  {title}: {len(entries)} node id(s)"]
     lines += [f"    {entry}" for entry in entries[:MAX_NAMED]]
@@ -120,11 +137,14 @@ def coverage_findings(shards: Sequence[ShardLane]) -> list[str]:
     drifted, differing = find_collection_drift(shards)
     collected = set().union(*(shard.full for shard in shards))
     selected = set().union(*(shard.split for shard in shards))
+    not_run, unselected = find_run_gaps(shards)
     categories = [
         (f"non-deterministic collection (full list of {', '.join(drifted)} differs from {shards[0].name})", differing),
         ("duplicate", find_duplicates(shards)),
         ("missed", sorted(collected - selected)),
         ("unexpected", sorted(selected - collected)),
+        ("not run", not_run),
+        ("ran unselected", unselected),
     ]
     return [line for title, entries in categories if entries for line in format_category(title, entries)]
 

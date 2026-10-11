@@ -19,9 +19,11 @@ named files, not the whole suite.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -147,9 +149,10 @@ def test_xdist_workers_write_the_same_lists_once(tmp_path: Path) -> None:
     proc = _pytest("-n", "2", "--test-lane", "parallel", f"--node-id-dir={workers}", *files)
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert sorted(p.name for p in workers.iterdir()) == ["parallel-full.txt", "parallel-split.txt"]
+    assert sorted(p.name for p in workers.iterdir()) == ["parallel-full.txt", "parallel-ran.txt", "parallel-split.txt"]
     assert _written(workers, "parallel-full") == _written(single, "parallel-full")
     assert _written(workers, "parallel-split") == _written(single, "parallel-split")
+    assert sorted(_written(workers, "parallel-ran")) == sorted(_written(single, "parallel-split"))
 
 
 def test_an_empty_split_passes_and_writes_an_empty_list(tmp_path: Path) -> None:
@@ -201,3 +204,45 @@ def test_lists_can_go_to_a_directory_that_already_exists(tmp_path: Path) -> None
     assert sorted(p.name for p in tmp_path.iterdir()) == [
         "parallel-full.txt", "parallel-split.txt", "serial-full.txt", "serial-split.txt",
     ]
+
+
+def test_a_worker_lost_in_collection_fails_the_coverage_check(tmp_path: Path) -> None:
+    """xdist 3.8 exits 0 with "no tests ran" when a worker dies during
+    collection, after ``gw0`` has written a split full of tests. The ran list
+    is what lets the coverage check see that nothing ran."""
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "lose_a_worker.py").write_text(textwrap.dedent("""\
+        import os
+
+        def pytest_collection_modifyitems(config, items):
+            workerinput = getattr(config, "workerinput", None)
+            if workerinput is not None and workerinput["workerid"] != "gw0":
+                os._exit(1)
+    """))
+    shard = tmp_path / "ids" / "shard-1"
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(plugin_dir), os.environ.get("PYTHONPATH", "")])}
+    cmd = [
+        sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "lose_a_worker",
+        "-n", "2", "--max-worker-restart=0", "--test-lane", "parallel", "--splits", "1", "--group", "1",
+        DURATIONS, f"--node-id-dir={shard}", PARALLEL_ONLY_FILE,
+    ]
+    run = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=300, check=False)
+    assert "no tests ran" in run.stdout, "control: the worker was lost before anything ran"
+    assert _written(shard, "parallel-split"), "control: the split still lists the tests"
+
+    check = subprocess.run(
+        [sys.executable, "tools/check_shard_coverage.py", f"--root={tmp_path / 'ids'}", "--shards", "1"],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert check.returncode != 0
+    assert "parallel: FAIL" in check.stdout and "not run:" in check.stdout, check.stdout
+
+
+def test_the_serial_lane_refuses_xdist_workers() -> None:
+    """The serial lane exists to keep racing multi-process tests off shared
+    workers; a CI command that passed ``-n 4`` to both lanes would otherwise
+    run them side by side and turn their timing into flakes."""
+    proc = _pytest("--collect-only", "-n", "2", "--test-lane", "serial", SERIAL_ONLY_FILE)
+    assert proc.returncode == pytest.ExitCode.USAGE_ERROR
+    assert "--test-lane serial runs with -n 0" in proc.stderr
