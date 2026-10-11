@@ -49,6 +49,7 @@ EXIT_PASS = 0
 EXIT_FAIL = 1
 EXIT_CANNOT_TELL = 2
 VERDICT_NAMES = {EXIT_PASS: "PASS", EXIT_FAIL: "FAIL", EXIT_CANNOT_TELL: "CANNOT TELL"}
+LIST_KINDS = ("full", "split")
 # Enough to start debugging; a broken split can name thousands of ids.
 MAX_NAMED = 20
 
@@ -56,7 +57,7 @@ MAX_NAMED = 20
 class ShardLane(NamedTuple):
     """One shard's two lists for one lane."""
 
-    shard: str
+    name: str
     full: list[str]
     split: list[str]
 
@@ -78,13 +79,13 @@ def load_lane(shard_dirs: Sequence[Path], lane: str) -> tuple[list[ShardLane], l
     problems: list[str] = []
     for shard_dir in shard_dirs:
         lists: dict[str, list[str]] = {}
-        for kind in ("full", "split"):
+        for kind in LIST_KINDS:
             path = shard_dir / f"{lane}-{kind}.txt"
             try:
                 lists[kind] = read_node_ids(path)
             except (OSError, UnicodeDecodeError) as exc:
                 problems.append(f"{shard_dir.name}/{path.name} ({type(exc).__name__})")
-        if len(lists) == 2:
+        if len(lists) == len(LIST_KINDS):
             loaded.append(ShardLane(shard_dir.name, lists["full"], lists["split"]))
     return loaded, problems
 
@@ -94,7 +95,7 @@ def find_collection_drift(shards: Sequence[ShardLane]) -> tuple[list[str], list[
     reference = set(shards[0].full)
     drifted = [shard for shard in shards[1:] if set(shard.full) != reference]
     differing = set().union(*(set(shard.full) ^ reference for shard in drifted))
-    return [shard.shard for shard in drifted], sorted(differing)
+    return [shard.name for shard in drifted], sorted(differing)
 
 
 def find_duplicates(shards: Sequence[ShardLane]) -> list[str]:
@@ -102,7 +103,7 @@ def find_duplicates(shards: Sequence[ShardLane]) -> list[str]:
     owners: dict[str, list[str]] = {}
     for shard in shards:
         for node_id in shard.split:
-            owners.setdefault(node_id, []).append(shard.shard)
+            owners.setdefault(node_id, []).append(shard.name)
     return [f"{node_id} ({', '.join(names)})" for node_id, names in sorted(owners.items()) if len(names) > 1]
 
 
@@ -119,9 +120,8 @@ def coverage_findings(shards: Sequence[ShardLane]) -> list[str]:
     drifted, differing = find_collection_drift(shards)
     collected = set().union(*(shard.full for shard in shards))
     selected = set().union(*(shard.split for shard in shards))
-    drift_title = f"non-deterministic collection (full list of {', '.join(drifted)} differs from {shards[0].shard})"
     categories = [
-        (drift_title, differing),
+        (f"non-deterministic collection (full list of {', '.join(drifted)} differs from {shards[0].name})", differing),
         ("duplicate", find_duplicates(shards)),
         ("missed", sorted(collected - selected)),
         ("unexpected", sorted(selected - collected)),
@@ -133,13 +133,13 @@ def check_lane(lane: str, shard_dirs: Sequence[Path]) -> LaneVerdict:
     shards, problems = load_lane(shard_dirs, lane)
     if problems:
         reasons = [f"  missing or unreadable: {problem}" for problem in problems]
-        return LaneVerdict(EXIT_CANNOT_TELL, [f"{lane}: CANNOT TELL", *reasons])
+        return LaneVerdict(EXIT_CANNOT_TELL, [f"{lane}: {VERDICT_NAMES[EXIT_CANNOT_TELL]}", *reasons])
     if not any(shard.full for shard in shards):
         reason = "  full list is empty in every shard; an empty collection proves nothing"
-        return LaneVerdict(EXIT_CANNOT_TELL, [f"{lane}: CANNOT TELL", reason])
+        return LaneVerdict(EXIT_CANNOT_TELL, [f"{lane}: {VERDICT_NAMES[EXIT_CANNOT_TELL]}", reason])
     findings = coverage_findings(shards)
     if findings:
-        return LaneVerdict(EXIT_FAIL, [f"{lane}: FAIL", *findings])
+        return LaneVerdict(EXIT_FAIL, [f"{lane}: {VERDICT_NAMES[EXIT_FAIL]}", *findings])
     total = len(set(shards[0].full))
     return LaneVerdict(EXIT_PASS, [f"{lane}: {total} tests, {len(shards)} shards, each run once"])
 
@@ -162,13 +162,18 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    # A root that was never created (no shard uploaded anything) is zero
-    # shards: cannot tell, not a crash.
-    shard_dirs = sorted(path for path in args.root.iterdir() if path.is_dir()) if args.root.is_dir() else []
+    try:
+        shard_dirs = sorted(path for path in args.root.iterdir() if path.is_dir())
+    except (FileNotFoundError, NotADirectoryError):
+        # No shard uploaded anything, so the root was never created: zero
+        # shards, which is cannot tell, not a crash.
+        shard_dirs = []
     if len(shard_dirs) != args.shards:
         names = ", ".join(path.name for path in shard_dirs) or "none"
-        print(f"CANNOT TELL: found {len(shard_dirs)} shard directories under {args.root} ({names}), "
-              f"expected {args.shards}")
+        print(
+            f"{VERDICT_NAMES[EXIT_CANNOT_TELL]}: found {len(shard_dirs)} shard directories under {args.root} "
+            f"({names}), expected {args.shards}"
+        )
         return EXIT_CANNOT_TELL
     verdicts = [check_lane(lane, shard_dirs) for lane in LANES]
     for verdict in verdicts:

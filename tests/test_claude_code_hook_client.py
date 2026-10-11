@@ -652,6 +652,7 @@ def test_session_start_unreachable_coordinator_returns_empty(
     # can take a freed port before the connect, and the client would then
     # talk to a stranger. Ports below 1024 are never handed out for port 0.
     with socket.socket() as probe:
+        probe.settimeout(2)
         assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
     dead_port = 4
     _fake_coherence_dir(git_workspace, port=dead_port)

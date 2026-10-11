@@ -26,14 +26,14 @@ from ccs.testing.process_harness import (
     ProcessRaceHarness,
 )
 
+# Spawns real processes that race each other: run with -n 0 (tests/conftest.py).
+pytestmark = pytest.mark.serial
+
 # ---------------------------------------------------------------------------
 # Top-level contender callables (spawn-context children unpickle by qualname,
 # so they must be module-level and import-clean).
 # ---------------------------------------------------------------------------
 
-
-# Spawns real processes that race each other: run with -n 0 (tests/conftest.py).
-pytestmark = pytest.mark.serial
 
 def _append_and_return(ctx, path_str: str, token: str) -> str:
     """Rendezvous, then append our token to a shared file, then return it."""

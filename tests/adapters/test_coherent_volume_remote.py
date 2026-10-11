@@ -39,9 +39,10 @@ def _refusing_port() -> int:
     test worker's port-0 bind before the connect, and the connect then reaches
     a stranger. Ports below 1024 are never handed out for port 0, and port 4
     is unassigned, so no standard service listens on it; the assert says so
-    if something does. A socket bound without listening is no substitute: on macOS a
-    connect to it hangs until its timeout instead of being refused."""
+    if something does. A socket bound without listening is no substitute: on
+    macOS a connect to it hangs until its timeout instead of being refused."""
     with socket.socket() as probe:
+        probe.settimeout(2)
         assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
     return 4
 

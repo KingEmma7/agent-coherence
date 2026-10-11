@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 
 SERIAL_MARKER = "serial"
-LANES = ("parallel", "serial")
+PARALLEL_LANE, SERIAL_LANE = LANES = ("parallel", "serial")
 
 collect_ignore_glob: list[str] = []
 
@@ -96,7 +96,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     lane after the ``addopts`` exclusions and before splitting."""
     lane = config.getoption("test_lane")
     if lane is not None:
-        want_serial = lane == SERIAL_MARKER
+        want_serial = lane == SERIAL_LANE
         kept: list[pytest.Item] = []
         dropped: list[pytest.Item] = []
         for item in items:
@@ -121,7 +121,7 @@ def _write_node_ids(config: pytest.Config, kind: str, items: list[pytest.Item]) 
     path.parent.mkdir(parents=True, exist_ok=True)
     # Exclusive create: a second writer for one list is a bug in this hook,
     # and the run should fail rather than let it overwrite the evidence.
-    with path.open("x") as out:
+    with path.open("x", encoding="utf-8") as out:
         out.writelines(f"{item.nodeid}\n" for item in items)
 
 
@@ -141,7 +141,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     if (
         exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED
         and config.getoption("test_lane") is not None
-        and getattr(config.option, "splits", None)
+        and config.getoption("splits", None)
     ):
         session.exitstatus = pytest.ExitCode.OK
 
