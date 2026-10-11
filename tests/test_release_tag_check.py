@@ -21,6 +21,7 @@ passing after the real file changed.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -36,6 +37,7 @@ _TOOL = _REPO_ROOT / "tools" / "check_release_tag.py"
 _RELEASE_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "release.yml"
 _MCP_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "publish-mcp.yml"
 _RESOLVE_STEP = "Resolve the released tag"
+_SYNC_STEP = "Sync server.json version to the released tag"
 
 
 def _import_tool():
@@ -283,7 +285,7 @@ def test_resolve_step_reads_the_tag_from_the_triggering_event() -> None:
     env = steps[_RESOLVE_STEP]["env"]
     assert env["EVENT_RELEASE_TAG"] == "${{ github.event.release.tag_name }}"
     assert env["WORKFLOW_RUN_TAG"] == "${{ github.event.workflow_run.head_branch }}"
-    sync = steps["Sync server.json version to the released tag"]
+    sync = steps[_SYNC_STEP]
     assert sync["env"]["RELEASE_TAG"] == "${{ steps.release.outputs.tag }}"
 
 
@@ -331,11 +333,11 @@ _GH_STUB = textwrap.dedent(
 )
 
 
-def _resolve_step_script() -> str:
+def _step_script(name: str) -> str:
     for step in _mcp_steps():
-        if step.get("name") == _RESOLVE_STEP:
+        if step.get("name") == name:
             return step["run"]
-    raise AssertionError(f"no {_RESOLVE_STEP!r} step in {_MCP_WORKFLOW}")
+    raise AssertionError(f"no {name!r} step in {_MCP_WORKFLOW}")
 
 
 def _run_resolve(
@@ -375,7 +377,7 @@ def _run_resolve(
     # pipefail, so a failure inside a pipe would not stop the step there
     # either. The fail-closed tests below must not pass on a stricter shell.
     proc = subprocess.run(
-        ["bash", "-e", "-c", _resolve_step_script()],
+        ["bash", "-e", "-c", _step_script(_RESOLVE_STEP)],
         env=env,
         capture_output=True,
         text=True,
@@ -448,3 +450,22 @@ def test_failed_release_lookup_fails_the_job(tmp_path: Path) -> None:
     proc, outputs, _ = _run_resolve(tmp_path, workflow_run_tag="v0.15.0", gh_fails=True)
     assert proc.returncode != 0
     assert outputs == {}
+
+
+@_needs_bash
+@pytest.mark.skipif(shutil.which("jq") is None, reason="the step runs jq, as on the runner")
+def test_sync_step_writes_the_tag_version_into_both_server_json_fields(tmp_path: Path) -> None:
+    """The registry refuses a version it already holds, so both fields must move."""
+    shutil.copy(_REPO_ROOT / "server.json", tmp_path / "server.json")
+    proc = subprocess.run(
+        ["bash", "-e", "-c", _step_script(_SYNC_STEP)],
+        cwd=tmp_path,
+        env={**os.environ, "RELEASE_TAG": "v9.8.7"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    manifest = json.loads((tmp_path / "server.json").read_text())
+    assert manifest["version"] == "9.8.7"
+    assert manifest["packages"][0]["version"] == "9.8.7"
