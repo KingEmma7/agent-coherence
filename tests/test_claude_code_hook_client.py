@@ -645,13 +645,15 @@ def test_session_start_unreachable_coordinator_returns_empty(
 ) -> None:
     """Port file exists but nothing is listening (stale pid file after a
     coordinator crash) → the POST raises CoordinatorUnavailable → {}."""
+    import errno
     import socket
 
-    # Bind-then-close: the freed ephemeral port is near-certainly unbound,
-    # so the client's connect gets refused instead of talking to a stranger.
+    # Port 4, not a freed ephemeral port: another test worker's port-0 bind
+    # can take a freed port before the connect, and the client would then
+    # talk to a stranger. Ports below 1024 are never handed out for port 0.
     with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        dead_port = probe.getsockname()[1]
+        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
+    dead_port = 4
     _fake_coherence_dir(git_workspace, port=dead_port)
 
     cc_payload = {"session_id": _sid(), "source": "compact"}
