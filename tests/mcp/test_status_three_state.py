@@ -113,14 +113,15 @@ def test_build_status_forwards_the_registry_schema_version(count: int) -> None:
         {**_doc(1), "registry_schema_version": "10"},
         {**_doc(1), "registry_schema_version": True},
     ],
-    ids=["unreachable", "older-or-node-coordinator", "null", "not-an-integer", "bool"],
+    ids=["unreachable", "field-absent", "null", "not-an-integer", "bool"],
 )
 def test_build_status_never_invents_a_registry_schema_version(doc) -> None:
     """Cannot-tell stays ``None`` (the SC5 rule): an unreachable coordinator,
-    one that sends no ``registry_schema_version`` (an older release, or the
-    Node coordinator, whose ``schema_version`` counts a different ledger), and
-    a value that is not an integer each read ``None``. Prevents an agent
-    comparing a made-up or foreign number against a release's schema."""
+    an answer with no ``registry_schema_version`` (a coordinator built before
+    the field), and a value that is not an integer each read ``None``, even
+    beside a foreign ``schema_version`` like the Node coordinator's, which
+    counts a different ledger. Prevents an agent comparing a made-up or
+    foreign number against a release's schema."""
     config = SessionConfig(root=Path("/x"), managed=("data/**",))
     if doc is not None:
         doc = {**doc, "schema_version": 5}

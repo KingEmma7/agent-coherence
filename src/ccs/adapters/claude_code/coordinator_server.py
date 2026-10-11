@@ -6758,9 +6758,10 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
       ``SCHEMA_USER_VERSION``: the store format this coordinator writes. Its
       VALUE moves with each schema step, which is the point of the field --
       an older release refuses a store at a newer version -- while the KEY
-      is stable like the rest. It numbers the Python registry's own steps and
-      means something only beside ``coordinator_backend: "python"``; the Node
-      coordinator's ``schema_version`` counts a different ledger.
+      is stable like the rest. It numbers the Python registry's own steps, and
+      only this coordinator sends it: the Node coordinator's body carries
+      neither it nor ``coordinator_backend``, and its ``schema_version``
+      counts a different ledger.
 
       Fields may be ADDED in minor versions (additive change is
       non-breaking for dashboards using selective key access).

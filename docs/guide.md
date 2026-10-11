@@ -2998,7 +2998,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 | `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention. A win that completed or overtook a live handoff says which, in `handoff`; on a path this session handed off, the same `handed_off` deny as `swg_write` |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
-| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim`, its `session_agent_id` (the id another session names to hand it a path), the coordinator's two caller-principal counters, its `registry_schema_version` (the schema version of its store, `null` when the coordinator is unreachable or does not report one), and each path's handoff record. `per_path` is `null`, not `{}`, when the coordinator's `/status` answer carries no list of tracked paths, as a [degraded](#when-the-registry-is-busy) answer does when its registry was busy; the text result then says `per_path=unavailable`. Retry shortly and do not read it as nothing tracked. With `coordinator` `unknown`, `per_path` is `{}` and says nothing about what is tracked |
+| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim`, its `session_agent_id` (the id another session names to hand it a path), the coordinator's two caller-principal counters, its `registry_schema_version` (the schema version of its store; `null` when the coordinator is unreachable, which `coordinator` `unknown` shows, or when its answer carries no such field, as a coordinator built before the field does), and each path's handoff record. `per_path` is `null`, not `{}`, when the coordinator's `/status` answer carries no list of tracked paths, as a [degraded](#when-the-registry-is-busy) answer does when its registry was busy; the text result then says `per_path=unavailable`. Retry shortly and do not read it as nothing tracked. With `coordinator` `unknown`, `per_path` is `{}` and says nothing about what is tracked |
 | `swg_transfer` | Hands this session's claim on one or more paths to another session, named by that session's `session_agent_id`; see [From the MCP server](#from-the-mcp-server) |
 | `swg_accept` | As the successor, accepts a handoff without writing the path |
 | `swg_decline` | As the successor, declines a handoff; the giver may write the path again |
@@ -3032,7 +3032,7 @@ coordinator's `caller_principal_absent_total` and
 `caller_principal_refused_total`, `null` rather than `0` when the coordinator
 is unreachable or does not report them. It forwards the coordinator's
 `registry_schema_version` under the same rule: `null` when the coordinator is
-unreachable or sends none, as an older release or the Node coordinator does.
+unreachable or its answer carries no such field.
 
 **Multiple sessions, one workspace.** Multiple `stale-write-guard-fs` instances
 pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is denied
@@ -3775,17 +3775,21 @@ Python coordinator, `?detail=metrics` and a
 `.coherence/state.db`, an integer. The coordinator migrates the store to that
 version when it opens it, and an older release refuses a store at a newer
 version, so check this number before you run an older coordinator or library
-against the workspace. `coordinator_version` cannot tell you this: between
-releases one version string covers several schema steps. The number counts the
-Python coordinator's own schema steps. The Claude Code plugin's Node
-coordinator does not send it, and the `schema_version` that coordinator sends
-counts a different set of steps, so the two are not comparable.
+against the workspace. v0.14.0 and v0.14.1 write schema 7 and refuse a store at
+a higher number. `coordinator_version` cannot tell you this: between releases
+one version string covers several schema steps. The number counts the Python
+coordinator's own schema steps. The Claude Code plugin's Node coordinator does
+not send it, and the `schema_version` that coordinator sends counts a
+different set of steps, so the two are not comparable.
 `agent-coherence-status` prints the number at the end of its `Coordinator:`
 header line, for example `schema=10`, and at the end of the summary line with
 `--detail metrics`; `--json` prints the field itself. A coordinator that does
 not send the field gets no `schema=` in either line. The MCP server's
-`swg_status` forwards the field as `registry_schema_version`, `null` when the
-coordinator is unreachable or does not send it.
+`swg_status` forwards the field as `registry_schema_version`. It is `null` when
+the coordinator is unreachable, which `coordinator` `unknown` shows, or when the
+coordinator's answer carries no such field. The MCP server does not attach to
+the Node coordinator or to a release up to v0.14.1 at all, because it cannot
+confirm their managed globs.
 
 ### `ccs-simulate` and `ccs-compare`
 
