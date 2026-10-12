@@ -530,6 +530,36 @@ Alpha — APIs may change before `v1.0`.
   between; `root` never changes. The private attributes are unchanged
   ([#262](https://github.com/Cohexa-ai/agent-coherence/issues/262)).
 
+- **`/status` reports the store format, as `registry_schema_version`.** Every
+  view of the Python coordinator's `/status` now carries
+  `registry_schema_version`, the schema version of the workspace's
+  `.coherence/state.db` (currently `10`). That includes `?detail=metrics` and a
+  degraded answer. `coordinator_version` could not tell you this: between
+  releases one version string covers several schema steps, and an older release
+  refuses a store at a newer schema (v0.14.0 and v0.14.1 write schema 7). The
+  field names no session or path. It counts the Python coordinator's own schema
+  steps, and only the Python coordinator sends it. The Claude Code plugin's
+  Node coordinator does not; the `schema_version` that coordinator sends counts
+  a different set of steps and is not comparable. The key will stay; its value
+  rises with each schema step
+  ([#294](https://github.com/Cohexa-ai/agent-coherence/issues/294)).
+
+- **`agent-coherence-status` shows the store format in its header.** The
+  table's `Coordinator:` line and the `--detail metrics` summary line now end
+  with `schema=N`, the coordinator's `registry_schema_version`, for example
+  `backend=python version=0.15.0.dev0 schema=10`. Against a coordinator that
+  does not send the field, such as an older release or the Claude Code
+  plugin's Node coordinator, both lines are unchanged
+  ([#294](https://github.com/Cohexa-ai/agent-coherence/issues/294)).
+
+- **`swg_status` forwards the store format.** The MCP server's `swg_status`
+  answer now carries `registry_schema_version`, forwarded from the
+  coordinator's `/status` the way the two caller-principal counters are:
+  `null`, never a guess, when the coordinator is unreachable (`coordinator`
+  reads `unknown`) or its answer carries no such field. The Node coordinator's
+  `schema_version` is never read in its place. The text result is unchanged
+  ([#294](https://github.com/Cohexa-ai/agent-coherence/issues/294)).
+
 ### Changed
 
 - **The `dev` extra adds `pytest-xdist` and `pytest-split`.** CI is moving
@@ -803,6 +833,23 @@ Alpha — APIs may change before `v1.0`.
   previously let an effect through. That is the fix, not a regression.
 
 ### Fixed
+
+- **The release workflow refuses a development version and publishes
+  pre-releases as pre-releases (#295).** A `v*` tag naming a development
+  version (`.devN`, which `dev` now reports) used to pass the release
+  workflow's tag check. Once approved, it would have gone to PyPI and become a
+  normal GitHub release, and the MCP Registry entry would have moved to it.
+  The check now fails such a tag before anything is built. An alpha, beta or
+  release candidate (`aN`, `bN`, `rcN`) still goes to PyPI, where pip installs
+  it only with `--pre` or an exact pin. Its GitHub release is now marked as a
+  pre-release, and the MCP Registry is left on the last final release. The
+  registry workflow now publishes the tag that started the release run, not
+  whichever release GitHub lists as latest. It acts only on a release run
+  started by a tag push in this repository, so a run from a fork cannot choose
+  the tag. It also reads the tag's name, so a release left marked final by an
+  older commit's workflow or by hand still stays off the registry: a
+  development version fails the job, and any name but a plain final version is
+  skipped.
 
 - **Opening a store the Node coordinator created no longer points you at a
   switch that does not exist.** The `CrossRuntimeSchemaError` raised for a
