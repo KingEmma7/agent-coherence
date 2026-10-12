@@ -57,17 +57,20 @@ import json
 import logging
 import os
 import re
+import secrets
 import socketserver
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
+
+import yaml
 
 from ccs.adapters.claude_code import audit_log as _audit_log
 from ccs.adapters.claude_code import hook_payloads as _payloads
@@ -82,7 +85,11 @@ from ccs.adapters.claude_code.auth import (
 )
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.bash_write_detector import detect_tracked_writes
-from ccs.adapters.claude_code.policy import UNTRACK_STRICT_PATH_REASON, TrackedArtifactPolicy
+from ccs.adapters.claude_code.policy import (
+    UNTRACK_STRICT_PATH_REASON,
+    TrackedArtifactPolicy,
+    policy_file_name,
+)
 from ccs.coordinator.registry_protocol import (
     RECLAIM_TRIGGERS,
     CheckpointMember,
@@ -3930,10 +3937,13 @@ def _handle_policy_track(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
       rejects control chars (newlines), absolute paths, and ../ traversal
       before being appended to tracked.yaml. Without this, a bearer-holding
       caller could POST {"paths":["real.md\\n- injected.yaml"]} and inject
-      additional patterns.
+      additional patterns. Rejecting newlines is not the whole defense: NEL,
+      LS and PS are YAML line breaks too. The writer quotes every entry
+      (#284), so no character can end an entry's line.
     - #11 (correctness 500→400): _append_policy_yaml's ValueError on YAML
-      cap overflow is caught and returned as HTTP 400 instead of falling
-      through the catch-all as a 500.
+      cap overflow, or on a file an entry could not take effect in, is
+      caught and returned as HTTP 400 instead of falling through the
+      catch-all as a 500.
     """
     body = req._read_json()
     if body is None:
@@ -8522,30 +8532,153 @@ def decide_tracked_read(
 # visible via ``agent_name`` on /status's operator tier.
 
 
-def _parse_yaml_pattern_lines(text: str) -> set[str]:
-    """Extract pattern strings already present in a YAML list file.
+_POLICY_REWRITE_HINT = (
+    'Rewrite it with one entry per line, each a double-quoted string such as - "*.md", then retry.'
+)
 
-    Used to detect already-present entries before appending, keeping
-    /policy/track idempotent. Uses yaml.safe_load so quoted values
-    (``- "plan.md"``) and inline comments are handled correctly.
-    Returns empty set on empty input or malformed YAML — the caller
-    re-appends, which is safe (MAX_POLICY_YAML_BYTES caps growth)."""
-    if not text.strip():
-        return set()
-    import yaml as _yaml
+
+def _read_policy_entries(text: str | bytes, name: str) -> list[str]:
+    """The string entries the policy loader reads from a policy YAML body, in
+    file order; an empty or null document reads as none. Non-string items are
+    dropped, as the loader drops them.
+
+    Raises ValueError, which the policy routes answer as HTTP 400, naming the
+    file when the body loads as no entries because it is not valid YAML or not
+    a list: an entry appended to it would never apply (#284). Mirrors the
+    Node coordinator's ``readPolicyEntries``, and the refusal text matches
+    its own except for the parser's words."""
     try:
-        parsed = _yaml.safe_load(text)
-    except _yaml.YAMLError:
-        return set()
-    if not isinstance(parsed, list):
-        return set()
-    return {item for item in parsed if isinstance(item, str)}
+        raw = yaml.safe_load(text)
+    # PyYAML raises a plain ValueError for an impossible date (2026-13-45) and
+    # RecursionError for deep nesting: the body loads as no entries all the same.
+    except (yaml.YAMLError, ValueError, RecursionError) as exc:
+        raise ValueError(_invalid_policy_yaml_message(name, exc)) from None
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"{name} holds {_describe_yaml_value(raw)}, not a list, so it loads as no "
+            f"entries; nothing was written. {_POLICY_REWRITE_HINT}"
+        )
+    return [item for item in raw if isinstance(item, str)]
+
+
+def _invalid_policy_yaml_message(name: str, exc: Exception) -> str:
+    mark = getattr(exc, "problem_mark", None)
+    where = f" near line {mark.line + 1}, column {mark.column + 1}" if mark is not None else ""
+    # PyYAML quotes file content in its problem text with repr(), which escapes
+    # every control, format and separator character, so the line a client
+    # prints to a terminal reads as what it is.
+    problem = getattr(exc, "problem", None) or str(exc).splitlines()[0]
+    # PyYAML says "expected a single document in the stream" for a second ---,
+    # in the context, which (unlike the problem) never quotes the file.
+    if "single document" in (getattr(exc, "context", None) or ""):
+        cause = "The file holds more than one YAML document; remove the extra --- separators."
+    else:
+        cause = "An unclosed quote or bracket on an earlier line can cause this."
+    return (
+        f"{name} is not valid YAML, so it loads as no entries; nothing was written. "
+        f"The parser stopped{where}: {problem}. "
+        f"{cause} {_POLICY_REWRITE_HINT}"
+    )
+
+
+def _describe_yaml_value(value: object) -> str:
+    if isinstance(value, date):
+        return "a date"
+    if isinstance(value, bytes):
+        return "binary data"
+    if isinstance(value, (dict, set)):
+        return "a mapping"
+    if isinstance(value, str):
+        return "a single string"
+    if isinstance(value, bool):
+        return "a boolean"
+    if isinstance(value, (int, float)):
+        return "a number"
+    return f"a {type(value).__name__}"
+
+
+def _append_policy_entries(yaml_path: Path, candidates: list[str]) -> list[str]:
+    """Append each of ``candidates`` not already in the file, as a
+    double-quoted YAML scalar, and return the ones appended. Called with the
+    file's lock held, where there is one.
+
+    Quoted, never plain (#284): a plain ``- <entry>`` line lets YAML read the
+    entry as an alias, tag, comment, anchor, mapping, non-string or two lines
+    (NEL, LS and PS are YAML line breaks), and one such entry stops the whole
+    file parsing, which loads as no entries. PyYAML's own emitter is the one
+    quoting that loads back exactly for every entry ``validate_path`` admits;
+    ``json.dumps`` does not (it writes a surrogate pair for a character past
+    the BMP, and with ``ensure_ascii=False`` leaves NEL raw)."""
+    name = policy_file_name(yaml_path)
+    try:
+        # Bytes: PyYAML decodes them as the writer encodes, whatever the locale.
+        data = yaml_path.read_bytes()
+    except FileNotFoundError:
+        data = b""
+    current = _read_policy_entries(data, name)
+    already_present = set(current)
+    truly_new = [p for p in candidates if p not in already_present]
+    if not truly_new:
+        return []
+    new_lines = yaml.safe_dump(
+        truly_new, default_style='"', default_flow_style=False,
+        allow_unicode=True, width=float("inf"),
+    )
+    try:
+        existing = data.decode("utf-8")
+    except UnicodeDecodeError:
+        # PyYAML also reads UTF-16 by its byte-order mark; a UTF-8 line cannot
+        # be appended to that.
+        raise ValueError(
+            f"{name} is not UTF-8 text, so it cannot take a new line; nothing was "
+            f"written. {_POLICY_REWRITE_HINT}"
+        ) from None
+    new_content = existing.rstrip("\n") + "\n" + new_lines if existing else new_lines
+    if _entries_or_none(new_content, name) != current + truly_new:
+        raise ValueError(
+            f"{name} cannot take a new line without breaking what it holds (such as a "
+            '[ ... ] list, an indented list, a "..." end marker or a lone ~ or null); '
+            f"nothing was written. {_POLICY_REWRITE_HINT}"
+        )
+    if len(new_content.encode("utf-8")) > MAX_POLICY_YAML_BYTES:
+        raise ValueError(
+            f"policy YAML cap of {MAX_POLICY_YAML_BYTES} bytes would be exceeded"
+        )
+    _replace_policy_file(yaml_path, new_content)
+    return truly_new
+
+
+def _entries_or_none(text: str, name: str) -> list[str] | None:
+    """The entries ``text`` loads as, or None when it loads as no entries."""
+    try:
+        return _read_policy_entries(text, name)
+    except ValueError:
+        return None
+
+
+def _replace_policy_file(yaml_path: Path, content: str) -> None:
+    """Write ``content`` to a fresh temp file beside ``yaml_path`` and rename
+    it over the file, so a failed write (an encoding error, a full disk)
+    leaves the old file whole where a truncating write left it empty. The
+    temp name is random and created exclusively, so a symlink planted at a
+    predictable name is never followed. Same pattern as the Node writer."""
+    tmp = yaml_path.with_name(f"{yaml_path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp, yaml_path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str], list[dict]]:
     """Append valid patterns to a YAML file. Returns (added, rejected).
-    Honors MAX_POLICY_YAML_BYTES — raises ValueError if the resulting file
-    would exceed the cap.
+    Raises ValueError, which the routes answer as HTTP 400, when the file
+    would exceed MAX_POLICY_YAML_BYTES or an entry could not take effect in
+    it (see :func:`_append_policy_entries`); nothing is written then.
 
     R14 (Unit 6): the read-modify-write is wrapped in an ``fcntl.flock``
     exclusive lock on a sidecar ``<yaml_path>.lock`` file so two concurrent
@@ -8588,59 +8721,23 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
     if not added:
         return added, rejected
 
-    lock_path = yaml_path.with_suffix(yaml_path.suffix + ".lock")
     try:
         import fcntl as _fcntl
-        lock_fd: int | None = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
-            try:
-                existing = yaml_path.read_text()
-            except FileNotFoundError:
-                existing = ""
-            already_present = _parse_yaml_pattern_lines(existing)
-            truly_new = [p for p in added if p not in already_present]
-            if not truly_new:
-                return [], rejected
-            new_lines = "\n".join(f"- {p}" for p in truly_new)
-            new_content = (
-                (existing.rstrip("\n") + "\n" + new_lines + "\n") if existing
-                else (new_lines + "\n")
-            )
-            if len(new_content.encode("utf-8")) > MAX_POLICY_YAML_BYTES:
-                raise ValueError(
-                    f"policy YAML cap of {MAX_POLICY_YAML_BYTES} bytes would be exceeded"
-                )
-            yaml_path.write_text(new_content)
-            return truly_new, rejected
-        finally:
-            try:
-                _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
-            except OSError:
-                pass
-            try:
-                os.close(lock_fd)
-            except OSError:
-                pass
     except ImportError:
         # Windows fallback: no fcntl. Lifecycle already disables the
         # coordinator on Windows, but degrade defensively if reached.
+        return _append_policy_entries(yaml_path, added), rejected
+    lock_path = yaml_path.with_suffix(yaml_path.suffix + ".lock")
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+        return _append_policy_entries(yaml_path, added), rejected
+    finally:
         try:
-            existing = yaml_path.read_text()
-        except FileNotFoundError:
-            existing = ""
-        already_present = _parse_yaml_pattern_lines(existing)
-        truly_new = [p for p in added if p not in already_present]
-        if not truly_new:
-            return [], rejected
-        new_lines = "\n".join(f"- {p}" for p in truly_new)
-        new_content = (
-            (existing.rstrip("\n") + "\n" + new_lines + "\n") if existing
-            else (new_lines + "\n")
-        )
-        if len(new_content.encode("utf-8")) > MAX_POLICY_YAML_BYTES:
-            raise ValueError(
-                f"policy YAML cap of {MAX_POLICY_YAML_BYTES} bytes would be exceeded"
-            )
-        yaml_path.write_text(new_content)
-        return truly_new, rejected
+            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
