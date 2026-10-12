@@ -356,6 +356,8 @@ def _race_worker(args: tuple) -> tuple[int, int]:
     return (os.getpid(), port)
 
 
+# Ten real processes race for one port: run with -n 0 (tests/conftest.py).
+@pytest.mark.serial
 def test_ten_process_race_one_binds_others_read_same_port(
     workspace: Path,
 ) -> None:

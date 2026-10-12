@@ -1,6 +1,6 @@
 # Requires: pip install -e ".[langgraph,benchmark]"
 
-.PHONY: benchmark benchmark-check cost-benchmark cost-benchmark-check tla-check help
+.PHONY: benchmark benchmark-check cost-benchmark cost-benchmark-check tla-check test-durations help
 
 benchmark:  ## Run all three LangGraph benchmarks and write latest.json
 	python tools/run_benchmarks.py
@@ -33,6 +33,11 @@ tla-check:  ## Run TLC model checker on MESI, CrashRecovery, OCC, Fencing, Zombi
 # encoding / state constraint to converge in the CI budget (plan Unit 1, deferred).
 # The spec parses + semantically validates; wire it in once the CI config is tuned:
 #   $(TLC) -config formal/tla/AtomicPublish_CI.cfg formal/tla/AtomicPublish.tla
+
+TEST_DURATIONS := tests/.test_durations
+
+test-durations:  ## Time the whole suite serially and rewrite tests/.test_durations, which CI uses to balance its test shards
+	python -m pytest -q -p no:cacheprovider --store-durations --clean-durations --durations-path $(TEST_DURATIONS)
 
 help:  ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
