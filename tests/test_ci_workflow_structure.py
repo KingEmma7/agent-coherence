@@ -13,11 +13,14 @@ properties the CI layout depends on.
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -184,3 +187,214 @@ def test_every_needs_reference_is_declared() -> None:
                 if output is not None:
                     declared = jobs[needed].get("outputs") or {}
                     assert output in declared, f"{name} reads undeclared {needed}.outputs.{output}"
+
+
+# The names `dev`'s branch protection requires. Frozen on purpose (tests/CLAUDE.md):
+# a job renamed in ci.yml leaves its required check pending forever, so the
+# rename has to be a deliberate edit here too.
+REQUIRED_CHECKS = frozenset(
+    {
+        "Lint",
+        "Architecture Checks",
+        "Tests (Python 3.11)",
+        "Tests (Python 3.12)",
+        "Benchmark Smoke",
+        "Benchmark Regression",
+        "TLA+ Model Check",
+        "Protocol Corpus (Python ↔ Node parity)",
+        "Build Package",
+    }
+)
+REQUIRED_CHECK_COUNT = 9
+TEST_GATES = {"tests-py311": "test-shards-py311", "tests-py312": "test-shards-py312"}
+TEST_GATE_PYTHON = {"tests-py311": "3.11", "tests-py312": "3.12"}
+OTHER_WORKFLOWS = ("publish-mcp.yml", "release.yml")
+COVERAGE_STEP = "Check that the shards ran every test exactly once"
+VERDICT_STEP = "Decide the verdict"
+TESTS_VERDICT_RUN = 'python3 tools/ci_gate_verdict.py tests --shards "$SHARDS" --coverage-exit "$COVERAGE_EXIT"'
+# `dev` brings the xdist and pytest-split the lanes need; `diagnose` and `mcp`
+# bring modules whose tests tests/conftest.py drops from collection when they
+# are missing, which the coverage check cannot see.
+SHARD_INSTALL = 'python -m pip install -e ".[dev,diagnose,mcp]"'
+
+
+def _job_names() -> dict[str, str]:
+    return {job_id: job.get("name", job_id) for job_id, job in _jobs().items()}
+
+
+def test_every_required_check_is_one_non_matrix_job() -> None:
+    """A required name on a matrix job that GitHub skips as a whole renders
+    unexpanded and never reports; a required name on two jobs is ambiguous."""
+    assert len(REQUIRED_CHECKS) == REQUIRED_CHECK_COUNT
+    names = list(_job_names().values())
+    for check in REQUIRED_CHECKS:
+        assert names.count(check) == 1, f"{check!r} names {names.count(check)} jobs"
+    jobs = _jobs()
+    for job_id, name in _job_names().items():
+        if name in REQUIRED_CHECKS:
+            assert "strategy" not in jobs[job_id], f"required check {name!r} is a matrix job"
+    for workflow in OTHER_WORKFLOWS:
+        other = yaml.safe_load((CI_WORKFLOW.parent / workflow).read_text())
+        other_names = {job.get("name", job_id) for job_id, job in other["jobs"].items()}
+        assert not other_names & REQUIRED_CHECKS, f"{workflow} reuses a required name"
+
+
+def test_the_corpus_needs_nothing_and_build_and_smoke_need_only_the_plan() -> None:
+    """A needed job that is skipped or failed cascades; the corpus must run
+    whatever else happens, and Build Package no longer waits on the long jobs."""
+    jobs = _jobs()
+    assert "needs" not in jobs["protocol-corpus"]
+    assert _needs(jobs["build"]) == ["plan"]
+    assert _needs(jobs["benchmark-smoke"]) == ["plan"]
+
+
+def test_plan_consumers_run_unless_cancelled() -> None:
+    """A plan job that died must not cascade-skip its consumers: a skipped
+    required check would read as passing."""
+    for job_id, job in _jobs().items():
+        if "plan" in _needs(job):
+            assert job.get("if") == "${{ !cancelled() }}", f"{job_id} would cascade-skip on a dead plan job"
+
+
+def test_the_test_gates_always_run_and_judge_their_shards() -> None:
+    """A gate skipped or cancelled with its run would leave the required check
+    in a state GitHub might count as passing; under always() it reports, and
+    its verdict reads its own shards' result and the coverage check's exit
+    code exactly. A hard-wired exit, an `|| true` or another leg's artifacts
+    would each pass the gate with nothing proven."""
+    jobs = _jobs()
+    for gate, shards in TEST_GATES.items():
+        job = jobs[gate]
+        assert job["if"] == "${{ always() }}"
+        assert _needs(job) == [shards]
+        download = _step(gate, "Download every shard's lists")
+        assert download["with"] == {"pattern": f"test-results-py{TEST_GATE_PYTHON[gate]}-shard-*", "path": "shards"}
+        coverage = _step(gate, COVERAGE_STEP)
+        assert coverage["id"] == "coverage"
+        assert '--root shards --shards "$TEST_SHARD_COUNT"' in coverage["run"]
+        assert _step(gate, VERDICT_STEP) == {
+            "name": VERDICT_STEP,
+            "env": {
+                "SHARDS": f"${{{{ needs.{shards}.result }}}}",
+                "COVERAGE_EXIT": "${{ steps.coverage.outputs.exit }}",
+            },
+            "run": TESTS_VERDICT_RUN,
+        }
+        _assert_gate_cannot_swallow_a_failure(gate, "Download every shard's lists")
+
+
+def _assert_gate_cannot_swallow_a_failure(gate: str, tolerant_step: str | None) -> None:
+    """A gate job reports its verdict step's exit, unless something lets that
+    step fail quietly: `continue-on-error` on the job or the step turns a FAIL
+    green, and an `if:` on a step can skip the verdict altogether. Only the
+    named download step may tolerate a failure, because a missing artifact
+    already reads as "cannot tell" to the coverage check."""
+    job = _jobs()[gate]
+    assert "continue-on-error" not in job, f"{gate} would pass with a failed verdict"
+    for step in job["steps"]:
+        if step.get("name") == tolerant_step:
+            continue
+        assert "continue-on-error" not in step and "if" not in step, (
+            f"{gate}: {step.get('name')!r} can swallow a failure"
+        )
+
+
+def _write_stub(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+
+
+@pytest.mark.parametrize("check_exit", [0, 1, 2])
+def test_the_coverage_step_hands_the_checks_exit_code_to_the_verdict(tmp_path: Path, check_exit: int) -> None:
+    """The coverage step runs under GitHub's `bash -e`, yet must finish and
+    record the coverage check's own exit code, whatever it is: the verdict
+    step reads only that value, so recording another command's status (or
+    stopping before the write) would let a failed or unprovable run pass."""
+    stub = f"import sys\nprint('coverage stub')\nsys.exit({check_exit})\n"
+    _write_stub(tmp_path / "tools" / "check_shard_coverage.py", stub)
+    _write_stub(tmp_path / "tools" / "summarize_junit.py", "print('junit stub')\n")
+    output, summary = tmp_path / "github_output", tmp_path / "step_summary"
+    env = {
+        "PATH": os.environ["PATH"],
+        "TEST_SHARD_COUNT": "2",
+        "GITHUB_OUTPUT": str(output),
+        "GITHUB_STEP_SUMMARY": str(summary),
+    }
+    for gate in TEST_GATES:
+        output.write_text("")
+        proc = subprocess.run(
+            ["bash", "-e", "-c", _step(gate, COVERAGE_STEP)["run"]],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert output.read_text().splitlines() == [f"exit={check_exit}"]
+
+
+def _shard_steps(job_id: str) -> list[dict[str, Any]]:
+    return _jobs()[job_id]["steps"]
+
+
+def _normalized_leg(job_id: str, version: str) -> str:
+    return yaml.safe_dump(_jobs()[job_id]).replace(version, "X").replace("py" + version.replace(".", ""), "pyX")
+
+
+def test_both_python_legs_run_identical_shards() -> None:
+    """The legs must differ only in the Python version; a step that exists in
+    one leg would silently check less in the other."""
+    assert _normalized_leg("test-shards-py311", "3.11") == _normalized_leg("test-shards-py312", "3.12")
+
+
+def test_both_python_legs_judge_identically() -> None:
+    """The gates must differ only in the Python version too; a gate reading
+    the other leg's lists would prove that leg's run, not its own."""
+    assert _normalized_leg("tests-py311", "3.11") == _normalized_leg("tests-py312", "3.12")
+
+
+def test_both_legs_install_every_extra_the_suite_collects() -> None:
+    """tests/conftest.py drops whole modules from collection when an optional
+    extra is missing, and the coverage check only proves each *collected* test
+    ran once: an extra dropped from the install line would shrink the suite
+    with every check green."""
+    for job_id in TEST_GATES.values():
+        installs = [step["run"] for step in _shard_steps(job_id) if "pip install -e" in step.get("run", "")]
+        assert len(installs) == 1, f"{job_id} has {len(installs)} editable installs"
+        assert installs[0].splitlines()[-1] == SHARD_INSTALL
+
+
+def test_the_shard_matrix_matches_the_shard_count() -> None:
+    """pytest-split's --splits, the matrix and the gate's --shards must agree,
+    or a group would never run and the coverage check would see too few shards."""
+    count = int(_workflow()["env"]["TEST_SHARD_COUNT"])
+    for job_id in TEST_GATES.values():
+        assert _jobs()[job_id]["strategy"]["matrix"]["shard"] == list(range(1, count + 1))
+
+
+def _step(job_id: str, name: str) -> dict[str, Any]:
+    steps = [step for step in _shard_steps(job_id) if step.get("name") == name]
+    assert len(steps) == 1, f"{job_id} has {len(steps)} {name!r} steps"
+    return steps[0]
+
+
+def test_the_lanes_run_as_tests_conftest_expects() -> None:
+    """The lane is a command-line option, never `-m` (which would replace the
+    addopts exclusions); the serial lane runs without workers and still runs
+    after a parallel-lane failure; the node-id directory is one argument, or
+    pytest takes the existing directory for a test path; the upload survives
+    a failed or cancelled shard so the gate can see what happened."""
+    for job_id in TEST_GATES.values():
+        parallel = _step(job_id, "Run the parallel lane")
+        serial = _step(job_id, "Run the serial lane")
+        upload = _step(job_id, "Upload node-id lists and test reports")
+        assert "-n 4 --dist worksteal --test-lane parallel" in parallel["run"]
+        assert "-n 0 --test-lane serial" in serial["run"]
+        assert serial["if"] == "${{ !cancelled() }}"
+        assert upload["if"] == "${{ always() }}"
+        for step in (parallel, serial):
+            assert " -m " not in f" {step['run']} "
+            assert '"--node-id-dir=lists/shard-$SHARD"' in step["run"]
+            assert "--durations-path tests/.test_durations" in step["run"]
