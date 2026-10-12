@@ -988,7 +988,7 @@ def test_a_redirected_bump_after_the_substrate_write_is_the_bump_legs_unknown(
     store.seed(REF, b"v1")
     _Redirector.code, _Redirector.seen = code, []
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _Redirector)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     real_post = substrate_module._coordinator_post
     redirected = "/hooks/post-edit-cas" if leg == "bump" else "/hooks/pre-read"
     sa = _session(tmp_path, fast_cfg)
@@ -1087,7 +1087,7 @@ def test_a_failed_completeness_check_of_a_converged_write_is_the_bump_legs_unkno
     store.seed(REF, b"v1")
     _Redirector.code, _Redirector.seen = (503 if failure == "http-503" else 302), []
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _Redirector)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     real_post = substrate_module._coordinator_post
     sa, sb = _session(tmp_path, fast_cfg), _session(tmp_path, fast_cfg)
     try:
@@ -1738,7 +1738,6 @@ def _serve_in_process(tmp_path: Path, instance_id: str):
     reachable through the usual pid file, so a test can reach into its
     registry. Policy is loaded once at construction, so the YAML is written
     first; a substrate session then attaches to it as to any spawned one."""
-    import time
 
     from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
 
@@ -1748,7 +1747,6 @@ def _serve_in_process(tmp_path: Path, instance_id: str):
         (coherence / name).write_text("- workspace/**\n")
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id=instance_id)
     server.serve_in_thread()
-    time.sleep(0.05)
     (coherence / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
     return server
 

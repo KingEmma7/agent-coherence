@@ -114,8 +114,6 @@ def coordinator(tmp_path: Path):
     """A live coordinator on a random port, with secret extracted for tests."""
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
     server.serve_in_thread()
-    # Small delay so server is accepting before tests fire.
-    time.sleep(0.05)
     try:
         yield server
     finally:
@@ -725,7 +723,6 @@ def strict_coordinator(tmp_path: Path):
     (tmp_path / ".coherence" / "strict_mode.yaml").write_text("- data/*.json\n")
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
     server.serve_in_thread()
-    time.sleep(0.05)
     try:
         yield server
     finally:
@@ -826,7 +823,6 @@ def test_a_stale_cas_on_a_strict_path_ignored_at_spawn_conflicts(tmp_path: Path)
     (tmp_path / ".coherence" / "ignored.yaml").write_text("- '**'\n")
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
     server.serve_in_thread()
-    time.sleep(0.05)
     try:
         client = _Client("127.0.0.1", server.port, load_secret(tmp_path))
         writer = _sid("ign-writer")
@@ -1816,6 +1812,31 @@ def test_i1_acquire_release_pair_balances_counter(tmp_path: Path) -> None:
         srv.shutdown()
 
 
+def test_a_stop_right_after_a_request_takes_well_under_the_old_half_second(tmp_path: Path) -> None:
+    """shutdown() waits for the accept loop to notice, and a served request
+    restarts the loop's wait. At the stdlib's 0.5 s poll every stop after a
+    request took about half a second; the coordinator polls every 50 ms.
+
+    The short sleep lets the loop re-enter its wait first: without it, a stop
+    can slip in before the loop goes back to sleep and return at once even at
+    0.5 s (1-3 trials in 100 on CI). Measured on ubuntu-24.04, 100 trials per
+    Python, idle and with three busy neighbours: the 50 ms poll stopped in at
+    most 0.043 s, the 0.5 s poll in no less than 0.480 s."""
+    for trial in range(3):
+        srv = CoordinatorHTTPServer(tmp_path / f"t{trial}", port=0, instance_id=f"stop-{trial}")
+        srv.serve_in_thread()
+        try:
+            secret = load_secret(srv.coordinator_root)
+            assert secret is not None
+            _Client("127.0.0.1", srv.port, secret).get("/status")
+            time.sleep(0.02)
+        finally:
+            started = time.monotonic()
+            srv.shutdown()
+            stopped_in = time.monotonic() - started
+        assert stopped_in < 0.25, f"trial {trial}: shutdown took {stopped_in:.3f} s"
+
+
 def test_i2_acquire_denied_after_shutdown_started(tmp_path: Path) -> None:
     """Once ``_shutting_down`` flips, acquire_handler_slot returns False
     so the dispatcher 503s instead of touching a closing registry."""
@@ -1838,7 +1859,6 @@ def test_i3_shutdown_waits_for_in_flight_handler(tmp_path: Path) -> None:
     returns rather than closing the registry under it."""
     srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="i3")
     srv.serve_in_thread()
-    time.sleep(0.05)
     secret = load_secret(srv.coordinator_root)
     assert secret is not None
     client = _Client("127.0.0.1", srv.port, secret)
@@ -1875,7 +1895,6 @@ def test_i4_shutdown_drain_timeout_records_flag(
     closes the registry anyway and records the timeout for observability."""
     srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="i4")
     srv.serve_in_thread()
-    time.sleep(0.05)
 
     # Keep an in-flight slot held for the duration of the test.
     assert srv.acquire_handler_slot() is True
@@ -2558,7 +2577,12 @@ def test_r10_status_snapshot_consistent_under_churn(
     writers = [threading.Thread(target=writer) for _ in range(4)]
     for t in writers: t.start()
     try:
-        for _ in range(20):
+        # Five reads, not more: a /status that iterates the live name map
+        # fails on the first one, and each later read is slower because the
+        # writers never stop growing the table (twenty reads took 25s). A
+        # copy taken without the lock is not caught here: list(dict.items())
+        # does not release the GIL.
+        for _ in range(5):
             s, _ = client.get("/status")
             assert s == 200, "status returned non-200 under register_session churn"
     finally:
@@ -3341,7 +3365,6 @@ def test_rel01_drain_no_deadlock_under_concurrent_dispatch(tmp_path: Path) -> No
     import threading as _t
     srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="rel01")
     srv.serve_in_thread()
-    time.sleep(0.05)
     secret = load_secret(srv.coordinator_root)
     assert secret is not None
     client = _Client("127.0.0.1", srv.port, secret)
@@ -5239,7 +5262,6 @@ def test_post_edit_preemption_reason_survives_a_real_restart(tmp_path: Path) -> 
 def _restart_on(root: Path, instance_id: str) -> CoordinatorHTTPServer:
     server = CoordinatorHTTPServer(root, port=0, instance_id=instance_id)
     server.serve_in_thread()
-    time.sleep(0.05)
     return server
 
 
@@ -6033,7 +6055,6 @@ def served_decider(tmp_path: Path):
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="u3a-served")
     _u3a_assert_policy(server)
     server.serve_in_thread()
-    time.sleep(0.05)
     secret = load_secret(server.coordinator_root)
     assert secret is not None
     try:
@@ -10963,7 +10984,6 @@ def test_a_name_the_registration_did_not_write_never_normalises_a_successor(
     stray = uuid.uuid4()
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="handoff-seeded-names")
     server.serve_in_thread()
-    time.sleep(0.05)
     try:
         client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
         giver, successor = _claimed(client), _claimed(client)
@@ -11399,7 +11419,6 @@ def test_a_givers_failed_edit_report_is_answered_handed_off_and_changes_nothing(
     server = CoordinatorHTTPServer(
         tmp_path, port=0, instance_id="handoff-failed-edit", state_log=entries.append)
     server.serve_in_thread()
-    time.sleep(0.05)
     try:
         client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
         giver, successor = _claimed(client), _claimed(client)
@@ -12407,7 +12426,6 @@ def test_a_coordinator_wiring_a_state_log_records_the_transfer_under_the_handoff
     entries: list[dict] = []
     server = CoordinatorHTTPServer(tmp_path, port=0, state_log=entries.append, instance_id="state-log")
     server.serve_in_thread()
-    time.sleep(0.05)
     try:
         client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
         giver, successor = _claimed(client), _claimed(client)
@@ -12689,7 +12707,6 @@ def _serve_strict_plan(root: Path) -> tuple[CoordinatorHTTPServer, _Client]:
     (coherence / "strict_mode.yaml").write_text("- plan.md\n")
     server = CoordinatorHTTPServer(root, port=0, instance_id="giver-shell-strict")
     server.serve_in_thread()
-    time.sleep(0.05)
     client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
     assert client.post("/hooks/pre-read", {"session_id": _STRICT_READER_SID, "path": "plan.md"})[0] == 200
     assert client.post("/hooks/pre-edit", {"session_id": _STRICT_WRITER_SID, "path": "plan.md"})[0] == 200

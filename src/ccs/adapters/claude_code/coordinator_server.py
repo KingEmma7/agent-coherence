@@ -240,6 +240,12 @@ the deadline, any still-running handlers are abandoned — they may raise
 ``sqlite3.ProgrammingError`` and return HTTP 500 to their clients. Better
 a 500 than a wedged shutdown (silent hang vs observable failure)."""
 
+SERVE_POLL_INTERVAL_SEC = 0.05
+"""How often the accept loop checks for a shutdown request. ``shutdown()``
+blocks until the loop notices, and every request restarts the loop's wait,
+so a stop that follows a request waits close to one full interval. The
+stdlib default of 0.5s made every coordinator stop take half a second."""
+
 # ADV-004: a sentinel preempter UUID the stable-grant sweep uses when
 # recording a preemption notice for an agent whose M/E grant it just
 # reclaimed. The F4 enrichment in ``_handle_post_edit`` compares against
@@ -1298,7 +1304,10 @@ class CoordinatorHTTPServer:
         if self._serve_thread is not None:
             return
         self._serve_thread = threading.Thread(
-            target=self._server.serve_forever, name="coord-http", daemon=True
+            target=self._server.serve_forever,
+            kwargs={"poll_interval": SERVE_POLL_INTERVAL_SEC},
+            name="coord-http",
+            daemon=True,
         )
         self._serve_thread.start()
 

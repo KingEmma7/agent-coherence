@@ -687,7 +687,7 @@ def test_an_empty_coordinator_answer_still_fails_open(
             pass
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _EmptyAnswers)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     try:
         _fake_coherence_dir(git_workspace, port=server.server_address[1])
         (git_workspace / "plan.md").write_text("plan")
@@ -762,7 +762,6 @@ def inproc_coordinator(git_workspace: Path):
     discoverable by the hook client through the usual pid file."""
     server = CoordinatorHTTPServer(git_workspace, port=0, instance_id="hook-principal")
     server.serve_in_thread()
-    time.sleep(0.05)
     assert load_secret(server.coordinator_root)
     (git_workspace / ".coherence" / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
     try:
@@ -1008,7 +1007,7 @@ def test_a_coordinator_that_issues_no_principals_gets_no_header(
     passes through, nothing is stored, nothing is reported."""
     _NoPrincipalCoordinator.seen = []
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _NoPrincipalCoordinator)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     try:
         _fake_coherence_dir(git_workspace, port=httpd.server_address[1])
         (git_workspace / "plan.md").write_text("plan")
@@ -1047,7 +1046,7 @@ def test_the_claim_is_skipped_only_when_the_pid_file_names_the_node_backend(
     coordinator) keeps the no-header fallback. Requests are counted."""
     _NoPrincipalCoordinator.seen = []
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _NoPrincipalCoordinator)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     try:
         _fake_coherence_dir(git_workspace, port=httpd.server_address[1])
         pid_file = git_workspace / ".coherence" / "server.pid"

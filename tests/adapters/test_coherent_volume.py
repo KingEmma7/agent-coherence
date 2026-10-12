@@ -4728,7 +4728,6 @@ def _serve_in_process(tmp_path: Path, instance_id: str):
         (coherence / name).write_text("- data/**\n")
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id=instance_id)
     server.serve_in_thread()
-    time.sleep(0.05)
     (coherence / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
     return server
 
@@ -6182,7 +6181,7 @@ def test_a_commit_that_fails_after_the_bytes_landed_takes_one_path_whatever_its_
     target = _seed(tmp_path, content=b"v1")
     _AnsweringCoordinator.status, _AnsweringCoordinator.seen = status, []
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _AnsweringCoordinator)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     vol = CoherentVolume(
         tmp_path, managed=("data/**",), on_error=on_error, config=fast_cfg  # type: ignore[arg-type]
     )
@@ -6270,7 +6269,7 @@ def test_a_redirect_echoing_the_nonce_a_claim_sent_names_no_location(
     _seed(tmp_path, content=b"v1")
     _EchoingRedirector.nonces, _EchoingRedirector.locations = [], []
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _EchoingRedirector)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     real_claim = coherent_volume_module.claim_caller_principal
     real_post = coherent_volume_module._coordinator_post
 

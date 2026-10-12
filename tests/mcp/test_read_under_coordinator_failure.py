@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import time
 from pathlib import Path
 
 import pytest
@@ -68,7 +67,6 @@ def _serve_in_process(tmp_path: Path, instance_id: str):
         (coherence / name).write_text("- data/**\n")
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id=instance_id)
     server.serve_in_thread()
-    time.sleep(0.05)
     (coherence / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
     return server
 
