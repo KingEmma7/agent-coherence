@@ -73,47 +73,72 @@ def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=True)
 
 
-def _repo_with_change(tmp_path: Path, changed: tuple[str, ...]) -> Path:
-    """A repo whose HEAD changes ``changed`` on top of a base commit, as the
-    first parent of a pull request's merge commit is the base."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
+def _pull_request_checkout(
+    tmp_path: Path, written: tuple[str, ...] = (), moved: tuple[tuple[str, str], ...] = (), depth: int = 2
+) -> Path:
+    """What the plan job checks out on a pull request: the merge commit of the
+    PR branch into a base that moved on since it branched, cloned at the
+    workflow's ``fetch-depth``. Its first parent is the base, so ``HEAD^1``
+    to ``HEAD`` is exactly what the PR changes."""
+    source = tmp_path / "source"
+    source.mkdir()
+    _git(source, "init", "-q", "-b", "dev")
+    _git(source, "config", "user.email", "t@example.com")
+    _git(source, "config", "user.name", "t")
     for name in BASE_FILES:
-        (repo / name).parent.mkdir(parents=True, exist_ok=True)
-        (repo / name).write_text("base\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    for name in changed:
-        (repo / name).parent.mkdir(parents=True, exist_ok=True)
-        (repo / name).write_text("changed\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "change", "--allow-empty")
-    return repo
+        (source / name).parent.mkdir(parents=True, exist_ok=True)
+        (source / name).write_text("base\n")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-qm", "base")
+    _git(source, "checkout", "-qb", "pr")
+    for name in written:
+        (source / name).parent.mkdir(parents=True, exist_ok=True)
+        (source / name).write_text("changed\n")
+    for old, new in moved:
+        (source / new).parent.mkdir(parents=True, exist_ok=True)
+        _git(source, "mv", old, new)
+    _git(source, "add", "-A")
+    _git(source, "commit", "-qm", "change", "--allow-empty")
+    _git(source, "checkout", "-q", "dev")
+    (source / "src" / "ccs" / "landed_meanwhile.py").write_text("base moved on\n")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-qm", "base moves on")
+    _git(source, "merge", "-q", "--no-ff", "pr", "-m", "merge pr into dev")
+    checkout = tmp_path / "checkout"
+    _git(tmp_path, "clone", "-q", f"--depth={depth}", source.resolve().as_uri(), str(checkout))
+    return checkout
 
 
 @pytest.mark.parametrize(
-    ("changed", "needed"),
+    ("written", "moved", "needed"),
     [
-        pytest.param(("src/ccs/x.py", "tests/test_x.py"), "false", id="code-and-tests-only"),
-        pytest.param(("docs/guide.md",), "false", id="docs-only"),
-        pytest.param(("formal/tla/OCC_CI.cfg",), "true", id="a-model-config"),
-        pytest.param(("formal/tla/NewSpec.tla",), "true", id="a-new-spec"),
-        pytest.param(("Makefile",), "true", id="the-makefile"),
-        pytest.param((".github/workflows/ci.yml",), "true", id="the-workflow"),
-        pytest.param((".github/actions/setup/action.yml",), "true", id="a-composite-action"),
-        pytest.param((), "true", id="an-empty-diff"),
+        pytest.param(("src/ccs/x.py", "tests/test_x.py"), (), "false", id="code-and-tests-only"),
+        pytest.param(("docs/guide.md",), (), "false", id="docs-only"),
+        pytest.param(("formal/tla/OCC_CI.cfg",), (), "true", id="a-model-config"),
+        pytest.param(("formal/tla/NewSpec.tla",), (), "true", id="a-new-spec"),
+        pytest.param(("Makefile",), (), "true", id="the-makefile"),
+        pytest.param((".github/workflows/ci.yml",), (), "true", id="the-workflow"),
+        pytest.param((".github/actions/setup/action.yml",), (), "true", id="a-composite-action"),
+        pytest.param((), (), "true", id="an-empty-diff"),
+        # git lists --name-only paths sorted, so a TLA+ input sorts both
+        # before and after the other paths here.
+        pytest.param(("docs/guide.md", "formal/tla/OCC.tla"), (), "true", id="docs-and-a-spec"),
+        pytest.param(("formal/tla/OCC.tla", "src/ccs/x.py"), (), "true", id="a-spec-and-code"),
+        pytest.param(("src/ccs/x.py", "tests/test_x.py", "Makefile"), (), "true", id="code-tests-and-the-makefile"),
+        pytest.param((), (("formal/tla/OCC.tla", "formal/common/OCC.tla"),), "true", id="a-spec-moved-out"),
+        pytest.param((), ((".github/workflows/ci.yml", "ci/ci.yml"),), "true", id="the-workflow-moved-out"),
+        pytest.param((), (("Makefile", "GNUmakefile"),), "true", id="the-makefile-renamed"),
+        pytest.param(("formal/tla/Café.tla",), (), "true", id="a-non-ascii-spec-path"),
     ],
 )
-def test_a_pull_request_needs_tla_only_when_a_tla_input_changed(tmp_path: Path, changed, needed) -> None:
+def test_a_pull_request_needs_tla_only_when_a_tla_input_changed(tmp_path: Path, written, moved, needed) -> None:
     """The bins may skip only on a pull request that provably left every TLA+
     input alone: the specs and configs (specs extend each other, so the whole
-    directory), the Makefile that runs them, and anything under .github. An
-    empty diff proves nothing, so it runs them."""
-    repo = _repo_with_change(tmp_path, changed)
-    exit_code, values = _run_plan(tmp_path, {"GITHUB_EVENT_NAME": "pull_request"}, cwd=repo)
+    directory), the Makefile that runs them, and anything under .github. A
+    move out of an input path changes that input, and so does a path git
+    would quote; an empty diff proves nothing, so it runs them."""
+    checkout = _pull_request_checkout(tmp_path, written, moved)
+    exit_code, values = _run_plan(tmp_path, {"GITHUB_EVENT_NAME": "pull_request"}, cwd=checkout)
     assert exit_code == 0
     assert values["tla-needed"] == needed
 
@@ -122,7 +147,20 @@ def test_a_pull_request_needs_tla_only_when_a_tla_input_changed(tmp_path: Path, 
 def test_every_other_event_needs_tla_whatever_the_diff(tmp_path: Path, event) -> None:
     """Only a pull request can skip the model check; a push to main or dev, a
     tag, a dispatch and the weekly run always run it."""
-    repo = _repo_with_change(tmp_path, ("src/ccs/x.py",))
-    exit_code, values = _run_plan(tmp_path, {"GITHUB_EVENT_NAME": event}, cwd=repo)
+    checkout = _pull_request_checkout(tmp_path, ("src/ccs/x.py",))
+    exit_code, values = _run_plan(tmp_path, {"GITHUB_EVENT_NAME": event}, cwd=checkout)
     assert exit_code == 0
     assert values["tla-needed"] == "true"
+
+
+def test_a_checkout_without_the_base_still_decides_the_tree(tmp_path: Path) -> None:
+    """At depth 1 the base commit is missing, so the diff fails and TLA+ is
+    needed; the tested tree does not depend on the base and is still decided.
+    One undecidable output must not take the others with it."""
+    checkout = _pull_request_checkout(tmp_path, ("src/ccs/x.py",), depth=1)
+    expected = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"], cwd=checkout, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    exit_code, values = _run_plan(tmp_path, {"GITHUB_EVENT_NAME": "pull_request"}, cwd=checkout)
+    assert exit_code == 0
+    assert values == {"tested-tree": expected, "tla-needed": "true"}

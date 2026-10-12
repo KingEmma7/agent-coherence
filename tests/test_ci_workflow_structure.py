@@ -483,4 +483,15 @@ def test_the_tla_gate_always_runs_and_judges_the_bins() -> None:
         "PLAN": "${{ needs.plan.result }}",
         "TLA_NEEDED": "${{ needs.plan.outputs.tla-needed }}",
     }
-    assert step["run"].startswith("python3 tools/ci_gate_verdict.py tla ")
+    assert step["run"] == (
+        'python3 tools/ci_gate_verdict.py tla --bins "$BINS" --event "$EVENT" --plan "$PLAN" --tla-needed "$TLA_NEEDED"'
+    )
+
+
+def test_the_plan_job_checks_out_the_base_with_the_merge() -> None:
+    """tools/ci_plan.py diffs the merge commit against its first parent; at
+    the default depth of 1 that parent is missing, the diff fails, and every
+    pull request runs the bins without anything turning red."""
+    steps = _jobs()["plan"]["steps"]
+    checkout = steps[_index_of(steps, lambda step: str(step.get("uses", "")).startswith("actions/checkout@"))]
+    assert checkout["with"] == {"fetch-depth": 2}

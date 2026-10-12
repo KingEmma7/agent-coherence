@@ -49,11 +49,20 @@ def tested_tree() -> str:
 
 
 def changed_paths() -> list[str]:
-    """Paths the checked-out merge commit changes against its first parent (the base)."""
+    """Paths the checked-out merge commit changes against its first parent (the base).
+
+    The flags pin the output shape instead of inheriting it: with rename
+    detection on, a file moved out of formal/tla/ lists only its new path, and
+    a quoted non-ASCII path no longer starts with its directory.
+    """
     result = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD^1", "HEAD"], capture_output=True, text=True, timeout=30, check=True
+        ["git", "diff", "--name-only", "--no-renames", "-z", "HEAD^1", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
     )
-    return [line for line in result.stdout.splitlines() if line]
+    return [path for path in result.stdout.split("\0") if path]
 
 
 def is_tla_input(path: str) -> bool:
