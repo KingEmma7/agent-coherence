@@ -650,9 +650,6 @@ def test_empty_and_pathological_commands_return_promptly() -> None:
         "open-calls-with-args", "open-calls-with-commas", "many-path-literals",
         "many-bound-names", "rename-then-blanks", "unlink-then-blanks", "copy-then-blanks",
         "copy-arg-then-blanks", "perl-open-then-blanks", "perl-open-mode-then-blanks", "bound-name-then-newlines"])
-# A 0.25 s CPU budget: beside three other xdist workers on a 4-core runner it
-# measured 0.30 s, so it runs in the serial lane (tests/conftest.py).
-@pytest.mark.serial
 def test_a_16k_script_body_is_scanned_in_linear_time(command: str) -> None:
     """Script and program checks stay linear on a 16K body: an ex prefix whose
     two whitespace runs could split one run many ways, an unbounded scan for
