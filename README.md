@@ -52,7 +52,7 @@ vol.write("plans/plan.md", revised_plan)   # stale view? denied fail-closed → 
 
 ## What it guarantees
 
-Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` runs all nine specs. CI runs them as three parallel jobs on every pull request that changes a spec, a model config, the Makefile or a workflow, and on every run outside a pull request. Every spec carries a documented mutant that must fail — the invariants are load-bearing, not decorative.
+Each row is a safety invariant model-checked with TLA+/TLC. `make tla-check` runs all nine specs. CI runs them as three parallel jobs on every pull request that changes a TLA+ input (the specs and their configs, the Makefile, the workflows, and the scripts that decide and judge the run), and on every run outside a pull request. Every spec carries a documented mutant that must fail — the invariants are load-bearing, not decorative.
 
 | The silent failure | What happens instead | Mechanism | Invariant |
 |---|---|---|---|

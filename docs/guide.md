@@ -1440,7 +1440,8 @@ Semantics, precisely:
   from its own data plane.
 
 The no-torn-read property is model-checked: `NoReadSkewWithinCut` and
-`PinAlwaysRetained` in `formal/tla/Snapshot.tla`, run by `make tla-check` in CI.
+`PinAlwaysRetained` in `formal/tla/Snapshot.tla`, part of `make tla-check`, which CI runs
+as three parallel jobs.
 
 **Honesty boundary.** Snapshot sessions prevent **read-skew** — torn reads across
 artifacts. They do not add write-skew prevention: commits validate per-artifact
