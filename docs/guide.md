@@ -3750,6 +3750,28 @@ on an answer without its two lists, such as a degraded one, which prints the
 body instead. An HTTP error reads `HTTP <code>: <error>`, with the
 coordinator's `error` text, or `HTTP <code>` when it sent none.
 
+**Policy files.** `track` and `untrack` add each path to
+`.coherence/tracked.yaml` or `.coherence/ignored.yaml` as a double-quoted YAML
+string (`- "*.md"`). A glob that YAML would otherwise read as something else,
+such as `*.md`, `[abc].md`, `{a,b}.md`, `yes` or `2026-10-12`, reads back
+exactly as written. When the file cannot take a new entry, the coordinator
+answers HTTP 400 naming the file, writes nothing, and the command exits `2`
+with that text. That happens when the file is not valid YAML or not a list,
+which the coordinator reads as no entries at all, or when an added line would
+break it: a `[ ... ]` list, an indented list, a `...` end marker or a lone `~`.
+Rewrite the file with one entry per line, each double-quoted, and retry.
+
+Releases up to 0.14.1 wrote entries without quotes. An entry starting with
+`*`, `[`, `{`, `!`, `&`, `%`, `@`, `|`, `>` or a quote, written by one of them,
+left the whole file unreadable, and the coordinator then dropped every entry
+in it without a word: tracked paths stopped being coordinated, ignored paths
+came back, and a strict path whose tracked entry was in the file lost strict
+mode at the next coordinator start. A policy file the coordinator cannot read
+now counts as a rejected pattern: `/status` reports it in
+`policy_summary.rejected_pattern_count`, and `agent-coherence-status` ends its
+Policy line with `, N rejected`. If you see that, rewrite the files in
+`.coherence/` as above and restart the coordinator.
+
 **Escaping.** Every string these commands print from a coordinator answer
 (paths, session names, states, reclaim triggers, handoff statuses, counter
 values, error text) has each non-printable character written the way Python's
