@@ -74,7 +74,7 @@ def _git(repo: Path, *args: str) -> None:
 
 
 def _pull_request_checkout(
-    tmp_path: Path, written: tuple[str, ...] = (), moved: tuple[tuple[str, str], ...] = (), depth: int = 2
+    tmp_path: Path, written: tuple[str, ...] = (), moved: tuple[tuple[str, str], ...] = (), *, depth: int = 2
 ) -> Path:
     """What the plan job checks out on a pull request: the merge commit of the
     PR branch into a base that moved on since it branched, cloned at the
@@ -110,48 +110,67 @@ def _pull_request_checkout(
 
 
 @pytest.mark.parametrize(
-    ("written", "moved", "needed"),
+    ("written", "needed"),
     [
-        pytest.param(("src/ccs/x.py", "tests/test_x.py"), (), "false", id="code-and-tests-only"),
-        pytest.param(("docs/guide.md",), (), "false", id="docs-only"),
-        pytest.param(("formal/tla/OCC_CI.cfg",), (), "true", id="a-model-config"),
-        pytest.param(("formal/tla/NewSpec.tla",), (), "true", id="a-new-spec"),
-        pytest.param(("Makefile",), (), "true", id="the-makefile"),
-        pytest.param((".github/workflows/ci.yml",), (), "true", id="the-workflow"),
-        pytest.param((".github/actions/setup/action.yml",), (), "true", id="a-composite-action"),
-        pytest.param(("tools/ci_plan.py",), (), "true", id="the-plan-script"),
-        pytest.param(("tools/ci_gate_verdict.py",), (), "true", id="the-gate-script"),
-        pytest.param((), (), "true", id="an-empty-diff"),
+        pytest.param(("src/ccs/x.py", "tests/test_x.py"), "false", id="code-and-tests-only"),
+        pytest.param(("docs/guide.md",), "false", id="docs-only"),
+        pytest.param(("formal/tla/OCC_CI.cfg",), "true", id="a-model-config"),
+        pytest.param(("formal/tla/NewSpec.tla",), "true", id="a-new-spec"),
+        pytest.param(("Makefile",), "true", id="the-makefile"),
+        pytest.param((".github/workflows/ci.yml",), "true", id="the-workflow"),
+        pytest.param((".github/actions/setup/action.yml",), "true", id="a-composite-action"),
+        pytest.param(("tools/ci_plan.py",), "true", id="the-plan-script"),
+        pytest.param(("tools/ci_gate_verdict.py",), "true", id="the-gate-script"),
+        pytest.param((), "true", id="an-empty-diff"),
         # git lists --name-only paths sorted, so a TLA+ input sorts both
         # before and after the other paths here.
-        pytest.param(("docs/guide.md", "formal/tla/OCC.tla"), (), "true", id="docs-and-a-spec"),
-        pytest.param(("formal/tla/OCC.tla", "src/ccs/x.py"), (), "true", id="a-spec-and-code"),
-        pytest.param(("src/ccs/x.py", "tests/test_x.py", "Makefile"), (), "true", id="code-tests-and-the-makefile"),
-        pytest.param((), (("formal/tla/OCC.tla", "formal/common/OCC.tla"),), "true", id="a-spec-moved-out"),
-        pytest.param((), ((".github/workflows/ci.yml", "ci/ci.yml"),), "true", id="the-workflow-moved-out"),
-        pytest.param((), (("Makefile", "GNUmakefile"),), "true", id="the-makefile-renamed"),
-        pytest.param(("formal/tla/Café.tla",), (), "true", id="a-non-ascii-spec-path"),
+        pytest.param(("docs/guide.md", "formal/tla/OCC.tla"), "true", id="docs-and-a-spec"),
+        pytest.param(("formal/tla/OCC.tla", "src/ccs/x.py"), "true", id="a-spec-and-code"),
+        pytest.param(("src/ccs/x.py", "tests/test_x.py", "Makefile"), "true", id="code-tests-and-the-makefile"),
+        pytest.param(("formal/tla/Café.tla",), "true", id="a-non-ascii-spec-path"),
     ],
 )
-def test_a_pull_request_needs_tla_only_when_a_tla_input_changed(tmp_path: Path, written, moved, needed) -> None:
+def test_a_pull_request_needs_tla_only_when_a_tla_input_changed(tmp_path: Path, written, needed) -> None:
     """The bins may skip only on a pull request that provably left every TLA+
     input alone: the specs and configs (specs extend each other, so the whole
     directory), the Makefile that runs them, anything under .github, and the
-    two scripts that decide and judge the run. A move out of an input path
-    changes that input, and so does a path git would quote; an empty diff
-    proves nothing, so it runs them."""
-    checkout = _pull_request_checkout(tmp_path, written, moved)
+    two scripts that decide and judge the run. A path git would quote is still
+    an input; an empty diff proves nothing, so it runs them."""
+    checkout = _pull_request_checkout(tmp_path, written)
     exit_code, values = _run_plan(tmp_path, {"GITHUB_EVENT_NAME": "pull_request"}, cwd=checkout)
     assert exit_code == 0
     assert values["tla-needed"] == needed
 
 
+@pytest.mark.parametrize(
+    "moved",
+    [
+        pytest.param(("formal/tla/OCC.tla", "formal/common/OCC.tla"), id="a-spec-moved-out"),
+        pytest.param((".github/workflows/ci.yml", "ci/ci.yml"), id="the-workflow-moved-out"),
+        pytest.param(("Makefile", "GNUmakefile"), id="the-makefile-renamed"),
+    ],
+)
+def test_a_pull_request_that_moves_an_input_away_needs_tla(tmp_path: Path, moved) -> None:
+    """Moving a file out of an input path changes that input: the file the
+    bins depend on is gone from where they expect it, so they must run even
+    though nothing under the input path was added or edited."""
+    checkout = _pull_request_checkout(tmp_path, moved=(moved,))
+    exit_code, values = _run_plan(tmp_path, {"GITHUB_EVENT_NAME": "pull_request"}, cwd=checkout)
+    assert exit_code == 0
+    assert values["tla-needed"] == "true"
+
+
+@pytest.fixture(scope="module")
+def _code_only_checkout(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One code-only pull request, read by every event below; as a pull request it would skip."""
+    return _pull_request_checkout(tmp_path_factory.mktemp("code-only"), ("src/ccs/x.py",))
+
+
 @pytest.mark.parametrize("event", ["push", "workflow_dispatch", "schedule", ""])
-def test_every_other_event_needs_tla_whatever_the_diff(tmp_path: Path, event) -> None:
+def test_every_other_event_needs_tla_whatever_the_diff(tmp_path: Path, _code_only_checkout: Path, event) -> None:
     """Only a pull request can skip the model check; a push to main or dev, a
     tag, a dispatch and the weekly run always run it."""
-    checkout = _pull_request_checkout(tmp_path, ("src/ccs/x.py",))
-    exit_code, values = _run_plan(tmp_path, {"GITHUB_EVENT_NAME": event}, cwd=checkout)
+    exit_code, values = _run_plan(tmp_path, {"GITHUB_EVENT_NAME": event}, cwd=_code_only_checkout)
     assert exit_code == 0
     assert values["tla-needed"] == "true"
 
