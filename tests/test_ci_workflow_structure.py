@@ -489,16 +489,19 @@ def test_the_tla_gate_always_runs_and_judges_the_bins() -> None:
     assert job["name"] == "TLA+ Model Check"
     assert job["if"] == "${{ always() }}"
     assert _needs(job) == ["plan", "tla-bins"]
-    step = job["steps"][-1]
-    assert step["env"] == {
-        "BINS": "${{ needs.tla-bins.result }}",
-        "EVENT": "${{ github.event_name }}",
-        "PLAN": "${{ needs.plan.result }}",
-        "TLA_NEEDED": "${{ needs.plan.outputs.tla-needed }}",
+    assert job["steps"][-1] == {
+        "name": VERDICT_STEP,
+        "env": {
+            "BINS": "${{ needs.tla-bins.result }}",
+            "EVENT": "${{ github.event_name }}",
+            "PLAN": "${{ needs.plan.result }}",
+            "TLA_NEEDED": "${{ needs.plan.outputs.tla-needed }}",
+        },
+        "run": (
+            'python3 tools/ci_gate_verdict.py tla --bins "$BINS" --event "$EVENT" --plan "$PLAN" --tla-needed "$TLA_NEEDED"'
+        ),
     }
-    assert step["run"] == (
-        'python3 tools/ci_gate_verdict.py tla --bins "$BINS" --event "$EVENT" --plan "$PLAN" --tla-needed "$TLA_NEEDED"'
-    )
+    _assert_gate_cannot_swallow_a_failure("tla-check", None)
 
 
 def _is_checkout(step: dict[str, Any]) -> bool:
