@@ -30,6 +30,7 @@ conftest is loaded. With neither option, nothing changes.
 from __future__ import annotations
 
 import importlib.util
+import signal
 from pathlib import Path
 
 import pytest
@@ -237,6 +238,24 @@ def _neutralize_v090_first_use_warning():
 
     _service._V090_FIRST_USE_WARNED = True
     yield
+
+
+@pytest.fixture(autouse=True)
+def _restore_sigpipe_disposition():
+    """Put SIGPIPE's disposition back after every test.
+
+    ``ccs.cli.diagnose.main()`` resets SIGPIPE to the default action for the
+    whole process, so ``ccs-diagnose | head`` exits quietly. Left that way, the
+    next test in the same process that writes to a closed socket kills the
+    process with no traceback; under xdist that took down a worker mid-run
+    (tests/test_diagnose_cli.py pins this)."""
+    if not hasattr(signal, "SIGPIPE"):
+        yield
+        return
+    saved = signal.getsignal(signal.SIGPIPE)
+    yield
+    if signal.getsignal(signal.SIGPIPE) != saved:
+        signal.signal(signal.SIGPIPE, saved)
 
 
 @pytest.fixture(params=["memory", "sqlite"])
