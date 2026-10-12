@@ -1356,6 +1356,25 @@ _STATUS_TEXT_WITHOUT_HANDOFF = (
 )
 
 
+@pytest.mark.parametrize(("rejected", "policy_line"), [
+    (2, "Policy: 3 default pattern(s), 0 user-added, 0 ignored, 2 rejected"),
+    (0, "Policy: 3 default pattern(s), 0 user-added, 0 ignored"),
+])
+def test_status_text_counts_rejected_patterns_only_when_there_are_any(
+    capsys: pytest.CaptureFixture[str], rejected: int, policy_line: str
+) -> None:
+    """A policy file that loads as no entries counts as a rejected pattern
+    (#284), and the Policy line says how many there are, so an operator sees
+    an emptied tracked.yaml instead of a workspace that merely has no user
+    patterns. With none, the line is exactly what it was."""
+    payload = _status_payload()
+    payload["policy_summary"]["rejected_pattern_count"] = rejected
+
+    coherence_status._render_table(payload)
+
+    assert policy_line in capsys.readouterr().out.splitlines()
+
+
 def _handoff_key(**extra: object) -> dict:
     return {
         "giver": _GIVER_AGENT, "successor": _SUCCESSOR_AGENT, "version_at_transfer": 2,

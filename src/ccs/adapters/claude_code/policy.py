@@ -854,6 +854,12 @@ def _glob_match(
     return matcher is not None and matcher(path)
 
 
+def policy_file_name(yaml_path: Path) -> str:
+    """How a refusal and a rejected entry name a policy file:
+    ``.coherence/tracked.yaml``, as the Node coordinator names it."""
+    return f"{yaml_path.parent.name}/{yaml_path.name}"
+
+
 def _load_yaml_patterns(
     yaml_path: Path, rejected: list[tuple[str, str]]
 ) -> list[str]:
@@ -864,17 +870,31 @@ def _load_yaml_patterns(
     Missing file → empty list (not an error).
     Malformed YAML → empty list + WARNING (do not crash hooks).
     Non-list top-level → empty list + WARNING.
+
+    A file that exists but loads as no entries is also recorded in
+    ``rejected``, named by its ``.coherence/`` path, so ``/status`` reports a
+    non-zero ``rejected_pattern_count``: a detached coordinator sends the
+    WARNING to /dev/null, and a strict path whose tracked entry was lost
+    with the file otherwise looked configured (#284).
     """
     if not yaml_path.is_file():
         return []
 
+    name = policy_file_name(yaml_path)
     try:
-        raw = yaml.safe_load(yaml_path.read_text())
-    except yaml.YAMLError as exc:
+        # Bytes, not text: PyYAML decodes them as UTF-8 (UTF-16 by BOM) whatever
+        # the locale, as the writer encodes, and undecodable bytes are a YAML
+        # error here instead of an exception out of every hook.
+        raw = yaml.safe_load(yaml_path.read_bytes())
+    # PyYAML raises a plain ValueError for an impossible date (2026-13-45) and
+    # RecursionError for deep nesting: the file loads as no entries all the same.
+    except (yaml.YAMLError, ValueError, RecursionError) as exc:
         logger.warning("malformed YAML at %s; falling back to defaults: %s", yaml_path, exc)
+        rejected.append((name, "not valid YAML, so the file loads as no entries"))
         return []
     except OSError as exc:
         logger.warning("could not read %s; falling back to defaults: %s", yaml_path, exc)
+        rejected.append((name, "could not be read, so the file loads as no entries"))
         return []
 
     if raw is None:
@@ -884,6 +904,9 @@ def _load_yaml_patterns(
             "%s top-level must be a list of patterns; got %s. Ignoring.",
             yaml_path,
             type(raw).__name__,
+        )
+        rejected.append(
+            (name, f"top level is {type(raw).__name__}, not a list, so the file loads as no entries")
         )
         return []
 
