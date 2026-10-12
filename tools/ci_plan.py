@@ -16,10 +16,10 @@ when it cannot be decided:
     tested-tree   the tree id of the checked-out commit (what this run tests);
                   empty when unknown
     tla-needed    ``false`` only on a pull request whose changes touch no TLA+
-                  input (anything under formal/tla/, the Makefile, anything
-                  under .github/, this script and tools/ci_gate_verdict.py);
-                  ``true`` on every other event, on an empty or failed diff,
-                  and when unknown
+                  input (anything under formal/tla/, any makefile GNU make
+                  reads, anything under .github/, this script and
+                  tools/ci_gate_verdict.py); ``true`` on every other event,
+                  on an empty or failed diff, and when unknown
 
 On ``pull_request`` the checkout is the merge commit at depth 2, so its first
 parent is the base: the diff between them is exactly what the PR changes.
@@ -39,8 +39,9 @@ OUTPUT_KEYS = ("tested-tree", "tla-needed")
 FALLBACKS = {"tested-tree": "", "tla-needed": "true"}
 # Specs extend each other, so the whole directory is one input. The two
 # scripts decide and judge the TLA+ run, so a change to them must run it.
+# GNU make reads GNUmakefile, then makefile, before Makefile.
 TLA_INPUT_PREFIXES = ("formal/tla/", ".github/")
-TLA_INPUT_FILES = ("Makefile", "tools/ci_plan.py", "tools/ci_gate_verdict.py")
+TLA_INPUT_FILES = ("GNUmakefile", "makefile", "Makefile", "tools/ci_plan.py", "tools/ci_gate_verdict.py")
 
 
 def tested_tree() -> str:

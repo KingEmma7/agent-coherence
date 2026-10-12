@@ -117,6 +117,11 @@ def _pull_request_checkout(
         pytest.param(("formal/tla/OCC_CI.cfg",), "true", id="a-model-config"),
         pytest.param(("formal/tla/NewSpec.tla",), "true", id="a-new-spec"),
         pytest.param(("Makefile",), "true", id="the-makefile"),
+        # GNU make reads GNUmakefile, then makefile, before Makefile, so adding
+        # either changes what `make tla-check-N` runs. (On a case-insensitive
+        # filesystem the lowercase case edits Makefile, which needs TLA+ too.)
+        pytest.param(("GNUmakefile",), "true", id="a-gnumakefile"),
+        pytest.param(("makefile",), "true", id="a-lowercase-makefile"),
         pytest.param((".github/workflows/ci.yml",), "true", id="the-workflow"),
         pytest.param((".github/actions/setup/action.yml",), "true", id="a-composite-action"),
         pytest.param(("tools/ci_plan.py",), "true", id="the-plan-script"),
