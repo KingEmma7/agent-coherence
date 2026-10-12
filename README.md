@@ -130,7 +130,7 @@ Five synchronization strategies ship out of the box: `lazy` (default), `eager`, 
 - **Simulation** (`ccs.simulation`) — deterministic tick-driven engine for scenario benchmarks with failure injection.
 - **Event bus** (`ccs.bus`) — the transport for invalidation signals; in-memory / in-process today (`InMemoryEventBus`). Networked transports (Redis, Kafka, NATS, gRPC) for a multi-host deployment are on the roadmap, demand-gated.
 
-Protocol safety properties — single-writer, monotonic versioning, the crash-recovery sweep invariants, the OCC no-lost-update, the reclamation fence's no-stale-apply, the effect gate's no-stale-admit, version retention's no-collected-read, the snapshot session's no-read-skew-within-cut, and workspace restore's no-partial-restore-registered — are model-checked with [TLA+/TLC](formal/tla/README.md). CI runs all nine specs, split across three parallel jobs, on every pull request that changes a TLA+ input (the specs and their configs, the Makefile, the workflows) and on every run outside a pull request.
+Protocol safety properties — single-writer, monotonic versioning, the crash-recovery sweep invariants, the OCC no-lost-update, the reclamation fence's no-stale-apply, the effect gate's no-stale-admit, version retention's no-collected-read, the snapshot session's no-read-skew-within-cut, and workspace restore's no-partial-restore-registered — are model-checked with [TLA+/TLC](formal/tla/README.md). CI runs all nine specs, split across three parallel jobs, on every pull request that changes a TLA+ input (the specs and their configs, the Makefile, the workflows, and the scripts that decide and judge the run) and on every run outside a pull request.
 
 ## Coherent workspace: the data plane for shared files
 

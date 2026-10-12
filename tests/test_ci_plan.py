@@ -119,6 +119,8 @@ def _pull_request_checkout(
         pytest.param(("Makefile",), (), "true", id="the-makefile"),
         pytest.param((".github/workflows/ci.yml",), (), "true", id="the-workflow"),
         pytest.param((".github/actions/setup/action.yml",), (), "true", id="a-composite-action"),
+        pytest.param(("tools/ci_plan.py",), (), "true", id="the-plan-script"),
+        pytest.param(("tools/ci_gate_verdict.py",), (), "true", id="the-gate-script"),
         pytest.param((), (), "true", id="an-empty-diff"),
         # git lists --name-only paths sorted, so a TLA+ input sorts both
         # before and after the other paths here.
@@ -134,9 +136,10 @@ def _pull_request_checkout(
 def test_a_pull_request_needs_tla_only_when_a_tla_input_changed(tmp_path: Path, written, moved, needed) -> None:
     """The bins may skip only on a pull request that provably left every TLA+
     input alone: the specs and configs (specs extend each other, so the whole
-    directory), the Makefile that runs them, and anything under .github. A
-    move out of an input path changes that input, and so does a path git
-    would quote; an empty diff proves nothing, so it runs them."""
+    directory), the Makefile that runs them, anything under .github, and the
+    two scripts that decide and judge the run. A move out of an input path
+    changes that input, and so does a path git would quote; an empty diff
+    proves nothing, so it runs them."""
     checkout = _pull_request_checkout(tmp_path, written, moved)
     exit_code, values = _run_plan(tmp_path, {"GITHUB_EVENT_NAME": "pull_request"}, cwd=checkout)
     assert exit_code == 0

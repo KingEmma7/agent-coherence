@@ -252,7 +252,8 @@ above is historical.
 Since 2026-10, CI does not run the sweep in one job. It runs the three Makefile bins
 (`tla-check-1`..`3`, same specs and configs) as parallel jobs, each capped at 20 minutes;
 each took about 4.5 minutes on a slow GitHub runner when the bins were drawn. A pull
-request that changes nothing under `formal/tla/`, the `Makefile` or `.github/` skips
+request that changes nothing under `formal/tla/`, the `Makefile`, `.github/` or the two
+scripts that plan and judge the run (`tools/ci_plan.py`, `tools/ci_gate_verdict.py`) skips
 them, and every other run runs all three. When a spec's time moves, rebalance the bins
 so the slowest stays near the others; `make tla-check` stays the local, sequential way
 to run everything.
