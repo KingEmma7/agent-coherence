@@ -22,6 +22,7 @@ found answered as writes -- never derived from the code under test.
 """
 from __future__ import annotations
 
+import gc
 import json
 import shlex
 import time
@@ -629,41 +630,86 @@ def test_empty_and_pathological_commands_return_promptly() -> None:
     assert time.monotonic() - started < 2.0
 
 
-@pytest.mark.parametrize("command", [
-    "ex <<< '" + " " * 16000 + "'",
-    "ex -c '" + " " * 16000 + "' f.md",
-    "ed -s f.md <<< '" + " " * 16000 + "'",
-    'python3 -c "' + "open(" * 3200 + '"',
-    'python3 -c "' + "open(a, " * 2000 + '"',
-    'python3 -c "' + "open(," * 2600 + '"',
-    'python3 -c "' + "x = 'a.md'; " * 1300 + "open('b.md', 'w')" + '"',
-    ('python3 -c "' + "".join(f"x{i} = 'a.md'; " for i in range(1000))
-     + "".join(f"open(x{i}, 'w'); " for i in range(60)) + '"')[:16384],
-    'python3 -c "p = \'a.md\'\nrename' + " " * 16000 + '"',
-    'python3 -c "p = \'a.md\'\nunlink' + " " * 16000 + '"',
-    'python3 -c "' + "".join(f"x{i} = 'a.md'\n" for i in range(16)) + "copyFile(" + " " * 16000 + '"',
-    'python3 -c "' + "".join(f"x{i} = 'a.md'\n" for i in range(64)) + "copyFile(x" + " " * 16000 + '"',
-    'python3 -c "p = \'a.md\'\nopen' + " " * 16000 + '"',
-    'python3 -c "' + "".join(f"x{i} = 'a.md'\n" for i in range(16)) + "open F, '>'," + " " * 16000 + '"',
-    'python3 -c "p = \'a.md\'\nwriteFileSync(q)' + "\n" * 16000 + '"',
-], ids=["ex-herestring-spaces", "ex-c-spaces", "ed-herestring-spaces", "open-calls",
-        "open-calls-with-args", "open-calls-with-commas", "many-path-literals",
-        "many-bound-names", "rename-then-blanks", "unlink-then-blanks", "copy-then-blanks",
-        "copy-arg-then-blanks", "perl-open-then-blanks", "perl-open-mode-then-blanks", "bound-name-then-newlines"])
-# A 0.25 s CPU budget: beside three other xdist workers on a 4-core runner it
-# measured 0.30 s, so it runs in the serial lane (tests/conftest.py).
-@pytest.mark.serial
-def test_a_16k_script_body_is_scanned_in_linear_time(command: str) -> None:
+#: A 16K command per rule that once backtracked on it (see the test below).
+_LINEAR_SCAN_CASES: dict[str, str] = {
+    "ex-herestring-spaces": "ex <<< '" + " " * 16000 + "'",
+    "ex-c-spaces": "ex -c '" + " " * 16000 + "' f.md",
+    "ed-herestring-spaces": "ed -s f.md <<< '" + " " * 16000 + "'",
+    "open-calls": 'python3 -c "' + "open(" * 3200 + '"',
+    "open-calls-with-args": 'python3 -c "' + "open(a, " * 2000 + '"',
+    "open-calls-with-commas": 'python3 -c "' + "open(," * 2600 + '"',
+    "many-path-literals": 'python3 -c "' + "x = 'a.md'; " * 1300 + "open('b.md', 'w')" + '"',
+    "many-bound-names": ('python3 -c "' + "".join(f"x{i} = 'a.md'; " for i in range(1000))
+                         + "".join(f"open(x{i}, 'w'); " for i in range(60)) + '"')[:16384],
+    "rename-then-blanks": 'python3 -c "p = \'a.md\'\nrename' + " " * 16000 + '"',
+    "unlink-then-blanks": 'python3 -c "p = \'a.md\'\nunlink' + " " * 16000 + '"',
+    "copy-then-blanks": 'python3 -c "' + "".join(f"x{i} = 'a.md'\n" for i in range(16)) + "copyFile(" + " " * 16000 + '"',
+    "copy-arg-then-blanks": (
+        'python3 -c "' + "".join(f"x{i} = 'a.md'\n" for i in range(64)) + "copyFile(x" + " " * 16000 + '"'
+    ),
+    "perl-open-then-blanks": 'python3 -c "p = \'a.md\'\nopen' + " " * 16000 + '"',
+    "perl-open-mode-then-blanks": (
+        'python3 -c "' + "".join(f"x{i} = 'a.md'\n" for i in range(16)) + "open F, '>'," + " " * 16000 + '"'
+    ),
+    "bound-name-then-newlines": 'python3 -c "p = \'a.md\'\nwriteFileSync(q)' + "\n" * 16000 + '"',
+}
+#: The case every other case is timed against, in the same process.
+_LINEAR_SCAN_REFERENCE = "many-path-literals"
+#: FROZEN: the most a case may take, warm, as a multiple of the reference.
+#: Twice each case's highest ratio on healthy code across 12 CI runner
+#: instances (4 CPU models, Python 3.11/3.12, idle and loaded):
+#: many-bound-names 2.43, copy-arg-then-blanks 1.34, every other case 1.03.
+#: The weakest measured regression (copy-arg-then-blanks before 14b2fe8)
+#: was never below 4.16; the others were above 12.9.
+_LINEAR_SCAN_RATIO_BOUNDS: dict[str, float] = {"many-bound-names": 4.9, "copy-arg-then-blanks": 2.7}
+_LINEAR_SCAN_DEFAULT_RATIO_BOUND = 2.1
+#: Every case's first (cold) call, absolute: a backstop for a regression that
+#: also slows the reference. Healthy code took at most 0.52 s on CI.
+_LINEAR_SCAN_COLD_CAP_SEC = 1.0
+
+
+def _cpu_seconds(command: str) -> float:
+    started = time.process_time()
+    _detect(command)
+    return time.process_time() - started
+
+
+@pytest.mark.parametrize(("case_id", "command"), list(_LINEAR_SCAN_CASES.items()), ids=list(_LINEAR_SCAN_CASES))
+def test_a_16k_script_body_is_scanned_in_linear_time(case_id: str, command: str) -> None:
     """Script and program checks stay linear on a 16K body: an ex prefix whose
     two whitespace runs could split one run many ways, an unbounded scan for
     an ``open(`` mode, following every one of a thousand bound names to the
     end of the body, or two blank patterns back to back in a write-call rule
     (after ``rename``, ``unlink``, ``copyFile(`` or a perl ``open``, or after
     each newline of a run) made one of these take seconds; the blank runs held
-    the coordinator for minutes."""
-    started = time.process_time()
-    _detect(command)
-    assert time.process_time() - started < 0.25
+    the coordinator for minutes.
+
+    CPU time differs about threefold between CI runners, so no absolute budget
+    both passes healthy code on a slow runner and fails the weakest regression
+    on a fast one. Each case is instead timed against the reference case in
+    the same process, warm (the first call compiles patterns, a fixed cost),
+    as the best of up to three interleaved pairs."""
+    cold = _cpu_seconds(command)
+    assert cold < _LINEAR_SCAN_COLD_CAP_SEC, f"{case_id}: first call took {cold:.3f} s of CPU"
+    if case_id == _LINEAR_SCAN_REFERENCE:
+        return
+    reference = _LINEAR_SCAN_CASES[_LINEAR_SCAN_REFERENCE]
+    bound = _LINEAR_SCAN_RATIO_BOUNDS.get(case_id, _LINEAR_SCAN_DEFAULT_RATIO_BOUND)
+    _detect(reference)
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        best_case = best_reference = float("inf")
+        for _ in range(3):
+            best_case = min(best_case, _cpu_seconds(command))
+            best_reference = min(best_reference, _cpu_seconds(reference))
+            if best_case / best_reference < bound:
+                break
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+    ratio = best_case / best_reference
+    assert ratio < bound, f"{case_id}: {best_case:.3f} s is {ratio:.2f}x the reference's {best_reference:.3f} s"
 
 
 #: FROZEN: one write call each, so a call dropped from the detector's table

@@ -1812,6 +1812,31 @@ def test_i1_acquire_release_pair_balances_counter(tmp_path: Path) -> None:
         srv.shutdown()
 
 
+def test_a_stop_right_after_a_request_takes_well_under_the_old_half_second(tmp_path: Path) -> None:
+    """shutdown() waits for the accept loop to notice, and a served request
+    restarts the loop's wait. At the stdlib's 0.5 s poll every stop after a
+    request took about half a second; the coordinator polls every 50 ms.
+
+    The short sleep lets the loop re-enter its wait first: without it, a stop
+    can slip in before the loop goes back to sleep and return at once even at
+    0.5 s (1-3 trials in 100 on CI). Measured on ubuntu-24.04, 100 trials per
+    Python, idle and with three busy neighbours: the 50 ms poll stopped in at
+    most 0.043 s, the 0.5 s poll in no less than 0.480 s."""
+    for trial in range(3):
+        srv = CoordinatorHTTPServer(tmp_path / f"t{trial}", port=0, instance_id=f"stop-{trial}")
+        srv.serve_in_thread()
+        try:
+            secret = load_secret(srv.coordinator_root)
+            assert secret is not None
+            _Client("127.0.0.1", srv.port, secret).get("/status")
+            time.sleep(0.02)
+        finally:
+            started = time.monotonic()
+            srv.shutdown()
+            stopped_in = time.monotonic() - started
+        assert stopped_in < 0.25, f"trial {trial}: shutdown took {stopped_in:.3f} s"
+
+
 def test_i2_acquire_denied_after_shutdown_started(tmp_path: Path) -> None:
     """Once ``_shutting_down`` flips, acquire_handler_slot returns False
     so the dispatcher 503s instead of touching a closing registry."""

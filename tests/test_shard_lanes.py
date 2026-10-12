@@ -37,12 +37,11 @@ EXPECTED_SERIAL_MODULES = frozenset(
         "tests/conformance/test_cross_process_coordinator.py",
         "tests/conformance/test_durability_regime.py",
         "tests/conformance/test_process_harness.py",
-        "tests/test_bash_write_detector.py",
         "tests/test_claude_code_hook_client.py",
         "tests/test_claude_code_lifecycle.py",
     }
 )
-EXPECTED_SERIAL_MODULE_COUNT = 6
+EXPECTED_SERIAL_MODULE_COUNT = 5
 
 SERIAL_ONLY_FILE = "tests/conformance/test_process_harness.py"
 MIXED_FILE = "tests/test_claude_code_hook_client.py"  # one serial test among parallel ones
