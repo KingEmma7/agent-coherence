@@ -276,12 +276,31 @@ def test_the_test_gates_always_run_and_judge_their_shards() -> None:
         coverage = _step(gate, COVERAGE_STEP)
         assert coverage["id"] == "coverage"
         assert '--root shards --shards "$TEST_SHARD_COUNT"' in coverage["run"]
-        verdict = _step(gate, VERDICT_STEP)
-        assert verdict["env"] == {
-            "SHARDS": f"${{{{ needs.{shards}.result }}}}",
-            "COVERAGE_EXIT": "${{ steps.coverage.outputs.exit }}",
+        assert _step(gate, VERDICT_STEP) == {
+            "name": VERDICT_STEP,
+            "env": {
+                "SHARDS": f"${{{{ needs.{shards}.result }}}}",
+                "COVERAGE_EXIT": "${{ steps.coverage.outputs.exit }}",
+            },
+            "run": TESTS_VERDICT_RUN,
         }
-        assert verdict["run"] == TESTS_VERDICT_RUN
+        _assert_gate_cannot_swallow_a_failure(gate, "Download every shard's lists")
+
+
+def _assert_gate_cannot_swallow_a_failure(gate: str, tolerant_step: str | None) -> None:
+    """A gate job reports its verdict step's exit, unless something lets that
+    step fail quietly: `continue-on-error` on the job or the step turns a FAIL
+    green, and an `if:` on a step can skip the verdict altogether. Only the
+    named download step may tolerate a failure, because a missing artifact
+    already reads as "cannot tell" to the coverage check."""
+    job = _jobs()[gate]
+    assert "continue-on-error" not in job, f"{gate} would pass with a failed verdict"
+    for step in job["steps"]:
+        if step.get("name") == tolerant_step:
+            continue
+        assert "continue-on-error" not in step and "if" not in step, (
+            f"{gate}: {step.get('name')!r} can swallow a failure"
+        )
 
 
 def _write_stub(path: Path, body: str) -> None:
