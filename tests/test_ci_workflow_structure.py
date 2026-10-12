@@ -271,23 +271,17 @@ def test_the_test_gates_always_run_and_judge_their_shards() -> None:
         job = jobs[gate]
         assert job["if"] == "${{ always() }}"
         assert _needs(job) == [shards]
-        download = _gate_step(gate, "Download every shard's lists")
+        download = _step(gate, "Download every shard's lists")
         assert download["with"] == {"pattern": f"test-results-py{TEST_GATE_PYTHON[gate]}-shard-*", "path": "shards"}
-        coverage = _gate_step(gate, COVERAGE_STEP)
+        coverage = _step(gate, COVERAGE_STEP)
         assert coverage["id"] == "coverage"
         assert '--root shards --shards "$TEST_SHARD_COUNT"' in coverage["run"]
-        verdict = _gate_step(gate, VERDICT_STEP)
+        verdict = _step(gate, VERDICT_STEP)
         assert verdict["env"] == {
             "SHARDS": f"${{{{ needs.{shards}.result }}}}",
             "COVERAGE_EXIT": "${{ steps.coverage.outputs.exit }}",
         }
         assert verdict["run"] == TESTS_VERDICT_RUN
-
-
-def _gate_step(gate: str, name: str) -> dict[str, Any]:
-    steps = [step for step in _jobs()[gate]["steps"] if step.get("name") == name]
-    assert len(steps) == 1, f"{gate} has {len(steps)} {name!r} steps"
-    return steps[0]
 
 
 def _write_stub(path: Path, body: str) -> None:
@@ -296,7 +290,7 @@ def _write_stub(path: Path, body: str) -> None:
 
 
 @pytest.mark.parametrize("check_exit", [0, 1, 2])
-def test_the_coverage_step_hands_the_check_s_exit_code_to_the_verdict(tmp_path: Path, check_exit: int) -> None:
+def test_the_coverage_step_hands_the_checks_exit_code_to_the_verdict(tmp_path: Path, check_exit: int) -> None:
     """The coverage step runs under GitHub's `bash -e`, yet must finish and
     record the coverage check's own exit code, whatever it is: the verdict
     step reads only that value, so recording another command's status (or
@@ -305,16 +299,16 @@ def test_the_coverage_step_hands_the_check_s_exit_code_to_the_verdict(tmp_path: 
     _write_stub(tmp_path / "tools" / "check_shard_coverage.py", stub)
     _write_stub(tmp_path / "tools" / "summarize_junit.py", "print('junit stub')\n")
     output, summary = tmp_path / "github_output", tmp_path / "step_summary"
+    env = {
+        "PATH": os.environ["PATH"],
+        "TEST_SHARD_COUNT": "2",
+        "GITHUB_OUTPUT": str(output),
+        "GITHUB_STEP_SUMMARY": str(summary),
+    }
     for gate in TEST_GATES:
         output.write_text("")
-        env = {
-            "PATH": os.environ["PATH"],
-            "TEST_SHARD_COUNT": "2",
-            "GITHUB_OUTPUT": str(output),
-            "GITHUB_STEP_SUMMARY": str(summary),
-        }
         proc = subprocess.run(
-            ["bash", "-e", "-c", _gate_step(gate, COVERAGE_STEP)["run"]],
+            ["bash", "-e", "-c", _step(gate, COVERAGE_STEP)["run"]],
             cwd=tmp_path,
             env=env,
             capture_output=True,
@@ -354,7 +348,7 @@ def test_both_legs_install_every_extra_the_suite_collects() -> None:
     for job_id in TEST_GATES.values():
         installs = [step["run"] for step in _shard_steps(job_id) if "pip install -e" in step.get("run", "")]
         assert len(installs) == 1, f"{job_id} has {len(installs)} editable installs"
-        assert SHARD_INSTALL in installs[0].splitlines()[-1]
+        assert installs[0].splitlines()[-1] == SHARD_INSTALL
 
 
 def test_the_shard_matrix_matches_the_shard_count() -> None:
