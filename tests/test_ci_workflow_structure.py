@@ -13,11 +13,14 @@ properties the CI layout depends on.
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -204,7 +207,15 @@ REQUIRED_CHECKS = frozenset(
 )
 REQUIRED_CHECK_COUNT = 9
 TEST_GATES = {"tests-py311": "test-shards-py311", "tests-py312": "test-shards-py312"}
+TEST_GATE_PYTHON = {"tests-py311": "3.11", "tests-py312": "3.12"}
 OTHER_WORKFLOWS = ("publish-mcp.yml", "release.yml")
+COVERAGE_STEP = "Check that the shards ran every test exactly once"
+VERDICT_STEP = "Decide the verdict"
+TESTS_VERDICT_RUN = 'python3 tools/ci_gate_verdict.py tests --shards "$SHARDS" --coverage-exit "$COVERAGE_EXIT"'
+# `dev` brings the xdist and pytest-split the lanes need; `diagnose` and `mcp`
+# bring modules whose tests tests/conftest.py drops from collection when they
+# are missing, which the coverage check cannot see.
+SHARD_INSTALL = 'python -m pip install -e ".[dev,diagnose,mcp]"'
 
 
 def _job_names() -> dict[str, str]:
@@ -252,27 +263,98 @@ def test_plan_consumers_run_unless_cancelled() -> None:
 def test_the_test_gates_always_run_and_judge_their_shards() -> None:
     """A gate skipped or cancelled with its run would leave the required check
     in a state GitHub might count as passing; under always() it reports, and
-    its verdict reads its own shards' result."""
+    its verdict reads its own shards' result and the coverage check's exit
+    code exactly. A hard-wired exit, an `|| true` or another leg's artifacts
+    would each pass the gate with nothing proven."""
     jobs = _jobs()
     for gate, shards in TEST_GATES.items():
         job = jobs[gate]
         assert job["if"] == "${{ always() }}"
         assert _needs(job) == [shards]
-        run_text = "\n".join(_strings(job))
-        assert f"needs.{shards}.result" in run_text
-        assert '--shards "$TEST_SHARD_COUNT"' in run_text
+        download = _gate_step(gate, "Download every shard's lists")
+        assert download["with"] == {"pattern": f"test-results-py{TEST_GATE_PYTHON[gate]}-shard-*", "path": "shards"}
+        coverage = _gate_step(gate, COVERAGE_STEP)
+        assert coverage["id"] == "coverage"
+        assert '--root shards --shards "$TEST_SHARD_COUNT"' in coverage["run"]
+        verdict = _gate_step(gate, VERDICT_STEP)
+        assert verdict["env"] == {
+            "SHARDS": f"${{{{ needs.{shards}.result }}}}",
+            "COVERAGE_EXIT": "${{ steps.coverage.outputs.exit }}",
+        }
+        assert verdict["run"] == TESTS_VERDICT_RUN
+
+
+def _gate_step(gate: str, name: str) -> dict[str, Any]:
+    steps = [step for step in _jobs()[gate]["steps"] if step.get("name") == name]
+    assert len(steps) == 1, f"{gate} has {len(steps)} {name!r} steps"
+    return steps[0]
+
+
+def _write_stub(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+
+
+@pytest.mark.parametrize("check_exit", [0, 1, 2])
+def test_the_coverage_step_hands_the_check_s_exit_code_to_the_verdict(tmp_path: Path, check_exit: int) -> None:
+    """The coverage step runs under GitHub's `bash -e`, yet must finish and
+    record the coverage check's own exit code, whatever it is: the verdict
+    step reads only that value, so recording another command's status (or
+    stopping before the write) would let a failed or unprovable run pass."""
+    stub = f"import sys\nprint('coverage stub')\nsys.exit({check_exit})\n"
+    _write_stub(tmp_path / "tools" / "check_shard_coverage.py", stub)
+    _write_stub(tmp_path / "tools" / "summarize_junit.py", "print('junit stub')\n")
+    output, summary = tmp_path / "github_output", tmp_path / "step_summary"
+    for gate in TEST_GATES:
+        output.write_text("")
+        env = {
+            "PATH": os.environ["PATH"],
+            "TEST_SHARD_COUNT": "2",
+            "GITHUB_OUTPUT": str(output),
+            "GITHUB_STEP_SUMMARY": str(summary),
+        }
+        proc = subprocess.run(
+            ["bash", "-e", "-c", _gate_step(gate, COVERAGE_STEP)["run"]],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert output.read_text().splitlines() == [f"exit={check_exit}"]
 
 
 def _shard_steps(job_id: str) -> list[dict[str, Any]]:
     return _jobs()[job_id]["steps"]
 
 
+def _normalized_leg(job_id: str, version: str) -> str:
+    return yaml.safe_dump(_jobs()[job_id]).replace(version, "X").replace("py" + version.replace(".", ""), "pyX")
+
+
 def test_both_python_legs_run_identical_shards() -> None:
     """The legs must differ only in the Python version; a step that exists in
     one leg would silently check less in the other."""
-    py311 = yaml.safe_dump(_jobs()["test-shards-py311"]).replace("3.11", "X")
-    py312 = yaml.safe_dump(_jobs()["test-shards-py312"]).replace("3.12", "X")
-    assert py311 == py312
+    assert _normalized_leg("test-shards-py311", "3.11") == _normalized_leg("test-shards-py312", "3.12")
+
+
+def test_both_python_legs_judge_identically() -> None:
+    """The gates must differ only in the Python version too; a gate reading
+    the other leg's lists would prove that leg's run, not its own."""
+    assert _normalized_leg("tests-py311", "3.11") == _normalized_leg("tests-py312", "3.12")
+
+
+def test_both_legs_install_every_extra_the_suite_collects() -> None:
+    """tests/conftest.py drops whole modules from collection when an optional
+    extra is missing, and the coverage check only proves each *collected* test
+    ran once: an extra dropped from the install line would shrink the suite
+    with every check green."""
+    for job_id in TEST_GATES.values():
+        installs = [step["run"] for step in _shard_steps(job_id) if "pip install -e" in step.get("run", "")]
+        assert len(installs) == 1, f"{job_id} has {len(installs)} editable installs"
+        assert SHARD_INSTALL in installs[0].splitlines()[-1]
 
 
 def test_the_shard_matrix_matches_the_shard_count() -> None:
