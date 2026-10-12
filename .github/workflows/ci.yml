@@ -76,6 +76,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       tested-tree: ${{ steps.plan.outputs.tested-tree }}
+      tla-needed: ${{ steps.plan.outputs.tla-needed }}
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
@@ -353,10 +354,22 @@ jobs:
       - name: Check benchmark regression
         run: python tools/benchmark_drift_check.py
 
-  tla-check:
-    name: TLA+ Model Check
+  # TLA+ runs as three bins in parallel (Makefile tla-check-1..3, which
+  # together are `make tla-check`'s nine specs with the same configs). Only a
+  # pull request that leaves every TLA+ input alone skips them: the condition
+  # needs both the pull_request event and the plan's exact `false`, so an
+  # empty or missing output runs them (tools/ci_plan.py).
+  tla-bins:
+    name: TLA+ bin ${{ matrix.bin }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
+    needs: [plan]
+    if: ${{ !cancelled() && !(github.event_name == 'pull_request' && needs.plan.outputs.tla-needed == 'false') }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        bin: [1, 2, 3]
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
@@ -366,8 +379,31 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Run TLC model checker
-        run: make tla-check
+      - name: Run TLC on this bin's specs
+        env:
+          BIN: ${{ matrix.bin }}
+        run: make "tla-check-$BIN"
+
+  # Carries the required check name. Passes when every bin passed, or when
+  # a pull request's plan said in exactly `false` that no TLA+ input changed
+  # (tools/ci_gate_verdict.py); a skip on any other event fails.
+  tla-check:
+    name: TLA+ Model Check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [plan, tla-bins]
+    if: ${{ always() }}
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - name: Decide the verdict
+        env:
+          BINS: ${{ needs.tla-bins.result }}
+          EVENT: ${{ github.event_name }}
+          PLAN: ${{ needs.plan.result }}
+          TLA_NEEDED: ${{ needs.plan.outputs.tla-needed }}
+        run: python3 tools/ci_gate_verdict.py tla --bins "$BINS" --event "$EVENT" --plan "$PLAN" --tla-needed "$TLA_NEEDED"
 
   protocol-corpus:
     name: Protocol Corpus (Python ↔ Node parity)

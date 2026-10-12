@@ -250,10 +250,14 @@ def test_the_corpus_needs_nothing_and_build_and_smoke_need_only_the_plan() -> No
 
 def test_plan_consumers_run_unless_cancelled() -> None:
     """A plan job that died must not cascade-skip its consumers: a skipped
-    required check would read as passing."""
+    required check would read as passing. Gates run under always(); every
+    other consumer's condition starts with !cancelled()."""
     for job_id, job in _jobs().items():
         if "plan" in _needs(job):
-            assert job.get("if") == "${{ !cancelled() }}", f"{job_id} would cascade-skip on a dead plan job"
+            condition = job.get("if", "")
+            assert condition == "${{ always() }}" or condition.startswith("${{ !cancelled()"), (
+                f"{job_id} would cascade-skip on a dead plan job"
+            )
 
 
 def test_the_test_gates_always_run_and_judge_their_shards() -> None:
@@ -398,3 +402,116 @@ def test_the_lanes_run_as_tests_conftest_expects() -> None:
             assert " -m " not in f" {step['run']} "
             assert '"--node-id-dir=lists/shard-$SHARD"' in step["run"]
             assert "--durations-path tests/.test_durations" in step["run"]
+
+
+MAKEFILE = REPO_ROOT / "Makefile"
+TLA_BINS = ("tla-check-1", "tla-check-2", "tla-check-3")
+# The nine (spec, config) pairs `make tla-check` has always run. Frozen on
+# purpose: a bin that dropped one would check less with every job green.
+# Every config is the spec's _CI one except MESI_Standalone, which has none;
+# AtomicPublish stays out (its state space does not converge in CI).
+TLA_SPEC_CONFIGS = frozenset(
+    {
+        ("MESI_Standalone.tla", "MESI_Standalone.cfg"),
+        ("CrashRecovery.tla", "CrashRecovery_CI.cfg"),
+        ("OCC.tla", "OCC_CI.cfg"),
+        ("Fencing.tla", "Fencing_CI.cfg"),
+        ("ZombieRevoke.tla", "ZombieRevoke_CI.cfg"),
+        ("EffectGate.tla", "EffectGate_CI.cfg"),
+        ("Retention.tla", "Retention_CI.cfg"),
+        ("Snapshot.tla", "Snapshot_CI.cfg"),
+        ("WorkspaceVersion.tla", "WorkspaceVersion_CI.cfg"),
+    }
+)
+TLA_SPEC_CONFIG_COUNT = 9
+TLC_RUN = re.compile(r"\$\(TLC\) -config formal/tla/(\S+) formal/tla/(\S+)")
+
+
+def _make_targets() -> dict[str, tuple[list[str], list[str]]]:
+    """Each Makefile target's prerequisites and recipe lines."""
+    targets: dict[str, tuple[list[str], list[str]]] = {}
+    current = None
+    for line in MAKEFILE.read_text().splitlines():
+        rule = re.match(r"^([A-Za-z0-9_.-]+):(?!=)\s*([^#]*)", line)
+        if rule and not line.startswith("\t"):
+            current = rule.group(1)
+            targets[current] = (rule.group(2).split(), [])
+        elif line.startswith("\t") and current is not None:
+            targets[current][1].append(line.strip())
+        else:
+            current = None
+    return targets
+
+
+def _tlc_pairs(recipe: list[str]) -> list[tuple[str, str]]:
+    return [(spec, config) for config, spec in (TLC_RUN.search(line).groups() for line in recipe if "$(TLC)" in line)]
+
+
+def test_the_tla_bins_cover_exactly_the_nine_specs_with_their_configs() -> None:
+    """Splitting the sweep must not drop, repeat or re-configure a spec; a
+    lower bound in a config silently checks less."""
+    assert len(TLA_SPEC_CONFIGS) == TLA_SPEC_CONFIG_COUNT
+    targets = _make_targets()
+    pairs = [pair for bin_target in TLA_BINS for pair in _tlc_pairs(targets[bin_target][1])]
+    assert len(pairs) == len(set(pairs)), "a spec runs in two bins"
+    assert set(pairs) == TLA_SPEC_CONFIGS
+    assert targets["tla-check"][0] == list(TLA_BINS)
+    assert not _tlc_pairs(targets["tla-check"][1]), "tla-check must run only through its bins"
+
+
+def test_every_tla_target_checks_java_first_and_never_cleans_up() -> None:
+    """A bin CI calls directly still checks Java; `-cleanup` deletes the shared
+    states/ directory under the other bins."""
+    targets = _make_targets()
+    for bin_target in TLA_BINS:
+        assert "tla-java-check" in targets[bin_target][0]
+    makefile = MAKEFILE.read_text()
+    assert "-cleanup" not in makefile
+    assert re.search(r"^\.NOTPARALLEL:", makefile, re.MULTILINE), "make -j would start three -workers auto JVMs"
+
+
+def test_the_tla_bins_skip_only_on_a_pull_request_the_plan_cleared() -> None:
+    """The skip needs both the event and the exact string `false`: an empty,
+    missing or misspelled plan output runs the bins, and no other event can
+    skip them."""
+    job = _jobs()["tla-bins"]
+    assert job["if"] == (
+        "${{ !cancelled() && !(github.event_name == 'pull_request' && needs.plan.outputs.tla-needed == 'false') }}"
+    )
+    assert job["strategy"]["matrix"]["bin"] == [1, 2, 3]
+    assert [step.get("run") for step in job["steps"] if "run" in step] == ['make "tla-check-$BIN"']
+
+
+def test_the_tla_gate_always_runs_and_judges_the_bins() -> None:
+    """The gate carries the required name; it must report on every outcome and
+    read the bins' result, the event and the plan's decision."""
+    job = _jobs()["tla-check"]
+    assert job["name"] == "TLA+ Model Check"
+    assert job["if"] == "${{ always() }}"
+    assert _needs(job) == ["plan", "tla-bins"]
+    assert job["steps"][-1] == {
+        "name": VERDICT_STEP,
+        "env": {
+            "BINS": "${{ needs.tla-bins.result }}",
+            "EVENT": "${{ github.event_name }}",
+            "PLAN": "${{ needs.plan.result }}",
+            "TLA_NEEDED": "${{ needs.plan.outputs.tla-needed }}",
+        },
+        "run": (
+            'python3 tools/ci_gate_verdict.py tla --bins "$BINS" --event "$EVENT" --plan "$PLAN" --tla-needed "$TLA_NEEDED"'
+        ),
+    }
+    _assert_gate_cannot_swallow_a_failure("tla-check", None)
+
+
+def _is_checkout(step: dict[str, Any]) -> bool:
+    return str(step.get("uses", "")).startswith("actions/checkout@")
+
+
+def test_the_plan_job_checks_out_the_base_with_the_merge() -> None:
+    """tools/ci_plan.py diffs the merge commit against its first parent; at
+    the default depth of 1 that parent is missing, the diff fails, and every
+    pull request runs the bins without anything turning red."""
+    steps = _jobs()["plan"]["steps"]
+    checkout = steps[_index_of(steps, _is_checkout)]
+    assert checkout["with"] == {"fetch-depth": 2}
