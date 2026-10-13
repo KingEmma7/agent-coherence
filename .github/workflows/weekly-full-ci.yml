@@ -8,8 +8,8 @@ name: weekly full CI
 # succeeded: a dispatch made with the workflow token runs as the bot, so this
 # run's own failure is what notifies the person who last edited the schedule.
 #
-# GitHub fires `schedule` only from the default branch, so this starts once a
-# release brings it to `main`; `workflow_dispatch` runs it by hand meanwhile.
+# GitHub fires `schedule` only from the repository's default branch, which is
+# `dev`; `workflow_dispatch` runs it by hand.
 on:
   schedule:
     - cron: "23 5 * * 1"
