@@ -386,11 +386,16 @@ def test_main_baseline_flag_runs_negative_control_then_with_ccs(
     output contains both phases. This pins the honest contract: broken-must-lose
     AND fixed-must-prevent in one invocation.
     """
-    # main() spawns a coordinator + clients in this process; the env nudge
-    # below is the same one main() applies for the local loopback path.
+    # main() spawns a coordinator + clients in this process, and for the local
+    # loopback path it sets CCS_REMOTE_COORDINATOR itself (setdefault). Make the
+    # flag absent while main() runs, so main() is what turns it on, and register
+    # it with monkeypatch, so it is gone again afterwards: otherwise every later
+    # test in this process runs with remote-coordinator mode switched on.
     monkeypatch.delenv("CCS_REMOTE_HOST", raising=False)
     monkeypatch.delenv("CCS_REMOTE_PORT", raising=False)
     monkeypatch.delenv("CCS_REMOTE_SECRET_FILE", raising=False)
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "0")
+    monkeypatch.delenv("CCS_REMOTE_COORDINATOR")
 
     # Import lazily so the test file does not depend on the example being on
     # the import path at collection time.

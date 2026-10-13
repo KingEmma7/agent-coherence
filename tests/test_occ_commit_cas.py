@@ -34,7 +34,6 @@ import hashlib
 import json
 import sys
 import threading
-import time
 import uuid
 import warnings
 from pathlib import Path
@@ -528,7 +527,6 @@ def _hash(label: str) -> str:
 def http_coordinator(tmp_path: Path):
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="unit7-instance")
     server.serve_in_thread()
-    time.sleep(0.05)
     try:
         yield server
     finally:

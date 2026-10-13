@@ -331,7 +331,7 @@ def _scripted_coordinator(root: Path, script: _Script) -> Iterator[None]:
     coherence = root / ".coherence"
     coherence.mkdir(mode=0o700)
     httpd = _ScriptedServer(_Coordinator, script)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     (coherence / "server.pid").write_text(f"12345\n{httpd.server_address[1]}\n")
     (coherence / "hook.secret").write_text("test-secret")
     try:

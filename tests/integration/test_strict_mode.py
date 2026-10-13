@@ -140,7 +140,6 @@ def strict_coordinator(workspace: Path):
     )
     server = CoordinatorHTTPServer(workspace, port=0, instance_id="strict-mode-test")
     server.serve_in_thread()
-    time.sleep(0.05)
     try:
         yield server
     finally:
@@ -1461,7 +1460,6 @@ class _Running:
             workspace, port=0, instance_id=f"handoff-{'strict' if strict else 'warn'}",
         )
         self.server.serve_in_thread()
-        time.sleep(0.05)
         secret = load_secret(self.server.coordinator_root)
         assert secret is not None
         self.client = _Client("127.0.0.1", self.server.port, secret)

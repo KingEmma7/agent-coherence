@@ -1639,7 +1639,7 @@ def stub_coordinator(git_workspace: Path):
     coherence = git_workspace / ".coherence"
     coherence.mkdir(mode=0o700)
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _StubCoordinator)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     port = httpd.server_address[1]
     (coherence / "server.pid").write_text(f"999\n{port}\n")
     (coherence / "hook.secret").write_text("test-secret")

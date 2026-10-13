@@ -562,6 +562,18 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **The `dev` extra adds `pytest-xdist` and `pytest-split`.** CI is moving
+  the test suite onto several workers and several jobs. To run it the same way
+  locally, run `pytest -n 4 --test-lane parallel`, then
+  `pytest --test-lane serial`; the second lane holds the tests marked `serial`,
+  which start real processes that race each other. Plain `pytest` is unchanged.
+
+- **A coordinator stops in about 50 ms instead of half a second.** The accept
+  loop checked for a stop request every 0.5 s, the standard library's default,
+  and every request restarted that wait, so a stop right after a request (an
+  idle shutdown, `stop_coordinator`, a migration hand-off) took about half a
+  second. The loop now checks every 50 ms.
+
 - **`dev` now reports version `0.15.0.dev0`, not `0.14.1` (#263).**
   `ccs.__version__`, and with it `/status`'s `coordinator_version` and the
   package metadata, still read `0.14.1` on `dev`, although the registry schema

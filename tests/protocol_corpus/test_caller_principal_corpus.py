@@ -31,7 +31,6 @@ import io
 import json
 import os
 import subprocess
-import time
 import uuid
 from pathlib import Path
 
@@ -308,7 +307,6 @@ def test_the_node_hook_client_is_attributed_through_the_python_coordinator(
     (tmp_path / "plan.md").write_text("plan v1")
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="cross-runtime-client")
     server.serve_in_thread()
-    time.sleep(0.05)
     try:
         assert load_secret(server.coordinator_root)
         (tmp_path / ".coherence" / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")

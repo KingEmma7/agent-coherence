@@ -100,7 +100,6 @@ class _Client:
 def coordinator(tmp_path: Path):
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
     server.serve_in_thread()
-    time.sleep(0.05)
     try:
         yield server
     finally:
@@ -787,7 +786,6 @@ def test_a_principal_appears_only_on_the_mint_response(
         tmp_path, port=0, instance_id="r5", state_log=state_log.append
     )
     server.serve_in_thread()
-    time.sleep(0.05)
     try:
         client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
         sid = _sid("r5")
@@ -872,7 +870,6 @@ def test_a_refused_request_carries_no_principal_into_any_log_body_or_status_tier
         tmp_path, port=0, instance_id="r5-refused", state_log=state_log.append
     )
     server.serve_in_thread()
-    time.sleep(0.05)
     try:
         client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
         caller, peer, unclaimed = _sid("r5-refused-caller"), _sid("r5-refused-peer"), _sid("r5-none")

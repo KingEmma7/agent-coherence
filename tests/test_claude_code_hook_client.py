@@ -645,13 +645,16 @@ def test_session_start_unreachable_coordinator_returns_empty(
 ) -> None:
     """Port file exists but nothing is listening (stale pid file after a
     coordinator crash) → the POST raises CoordinatorUnavailable → {}."""
+    import errno
     import socket
 
-    # Bind-then-close: the freed ephemeral port is near-certainly unbound,
-    # so the client's connect gets refused instead of talking to a stranger.
+    # Port 4, not a freed ephemeral port: another test worker's port-0 bind
+    # can take a freed port before the connect, and the client would then
+    # talk to a stranger. Ports below 1024 are never handed out for port 0.
     with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        dead_port = probe.getsockname()[1]
+        probe.settimeout(2)
+        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
+    dead_port = 4
     _fake_coherence_dir(git_workspace, port=dead_port)
 
     cc_payload = {"session_id": _sid(), "source": "compact"}
@@ -687,7 +690,7 @@ def test_an_empty_coordinator_answer_still_fails_open(
             pass
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _EmptyAnswers)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     try:
         _fake_coherence_dir(git_workspace, port=server.server_address[1])
         (git_workspace / "plan.md").write_text("plan")
@@ -762,7 +765,6 @@ def inproc_coordinator(git_workspace: Path):
     discoverable by the hook client through the usual pid file."""
     server = CoordinatorHTTPServer(git_workspace, port=0, instance_id="hook-principal")
     server.serve_in_thread()
-    time.sleep(0.05)
     assert load_secret(server.coordinator_root)
     (git_workspace / ".coherence" / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
     try:
@@ -827,6 +829,8 @@ def test_hook_client_claims_once_per_session_and_presents_the_stored_principal(
     assert server.registry.last_writer_for(artifact_id) == session_to_agent_id(sid, "sub-1")
 
 
+# Racing hook processes: run with -n 0 (tests/conftest.py).
+@pytest.mark.serial
 def test_racing_hook_processes_for_a_new_session_bind_one_principal(inproc_coordinator) -> None:
     """Two hook processes starting together for an unclaimed session produce
     ONE binding: the loser of the exclusive nonce create adopts the winner's
@@ -1008,7 +1012,7 @@ def test_a_coordinator_that_issues_no_principals_gets_no_header(
     passes through, nothing is stored, nothing is reported."""
     _NoPrincipalCoordinator.seen = []
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _NoPrincipalCoordinator)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     try:
         _fake_coherence_dir(git_workspace, port=httpd.server_address[1])
         (git_workspace / "plan.md").write_text("plan")
@@ -1047,7 +1051,7 @@ def test_the_claim_is_skipped_only_when_the_pid_file_names_the_node_backend(
     coordinator) keeps the no-header fallback. Requests are counted."""
     _NoPrincipalCoordinator.seen = []
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _NoPrincipalCoordinator)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     try:
         _fake_coherence_dir(git_workspace, port=httpd.server_address[1])
         pid_file = git_workspace / ".coherence" / "server.pid"
