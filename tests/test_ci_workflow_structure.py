@@ -13,6 +13,7 @@ properties the CI layout depends on.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -208,7 +209,7 @@ REQUIRED_CHECKS = frozenset(
 REQUIRED_CHECK_COUNT = 9
 TEST_GATES = {"tests-py311": "test-shards-py311", "tests-py312": "test-shards-py312"}
 TEST_GATE_PYTHON = {"tests-py311": "3.11", "tests-py312": "3.12"}
-OTHER_WORKFLOWS = ("publish-mcp.yml", "release.yml")
+OTHER_WORKFLOWS = ("publish-mcp.yml", "release.yml", "weekly-full-ci.yml")
 COVERAGE_STEP = "Check that the shards ran every test exactly once"
 VERDICT_STEP = "Decide the verdict"
 TESTS_VERDICT_RUN = 'python3 tools/ci_gate_verdict.py tests --shards "$SHARDS" --coverage-exit "$COVERAGE_EXIT"'
@@ -515,3 +516,180 @@ def test_the_plan_job_checks_out_the_base_with_the_merge() -> None:
     steps = _jobs()["plan"]["steps"]
     checkout = steps[_index_of(steps, _is_checkout)]
     assert checkout["with"] == {"fetch-depth": 2}
+
+
+WEEKLY_WORKFLOW = CI_WORKFLOW.parent / "weekly-full-ci.yml"
+WEEKLY_JOB = "full-run"
+WEEKLY_STEP = "Dispatch ci.yml on dev and wait for that run"
+# Minutes a dispatched run may sit queued behind other runs on the org's
+# shared job cap before its own jobs start.
+WEEKLY_QUEUE_MARGIN_MINUTES = 15
+WEEKLY_CRON = re.compile(r"^\d{1,2} \d{1,2} \* \* [0-6]$")
+RUN_TAG_RUN_NAME = "${{ inputs.run_tag && format('Weekly full CI ({0})', inputs.run_tag) || '' }}"
+
+
+def _weekly() -> dict[str, Any]:
+    return yaml.safe_load(WEEKLY_WORKFLOW.read_text())
+
+
+def _triggers(workflow: dict[str, Any]) -> dict[str, Any]:
+    # YAML 1.1 reads a bare `on` key as the boolean True.
+    return workflow.get("on", workflow.get(True)) or {}
+
+
+def _weekly_step() -> dict[str, Any]:
+    steps = [step for step in _weekly()["jobs"][WEEKLY_JOB]["steps"] if step.get("name") == WEEKLY_STEP]
+    assert len(steps) == 1, f"the weekly job has {len(steps)} {WEEKLY_STEP!r} steps"
+    return steps[0]
+
+
+def test_the_weekly_run_fires_once_a_week_and_by_hand() -> None:
+    """One cron entry that names a single weekday; a second entry or a range
+    would run the full suite more often than the job cap was sized for."""
+    triggers = _triggers(_weekly())
+    assert set(triggers) == {"schedule", "workflow_dispatch"}
+    crons = [entry["cron"] for entry in triggers["schedule"]]
+    assert len(crons) == 1 and WEEKLY_CRON.match(crons[0]), crons
+
+
+def test_the_weekly_run_can_only_dispatch_and_read_runs() -> None:
+    """A scheduled job runs from `main` with the repository's token; anything
+    wider than `actions: write` would let it write to the repository. It needs
+    no checkout, so it uses no actions at all."""
+    weekly = _weekly()
+    assert weekly["permissions"] == {"actions": "write"}
+    assert list(weekly["jobs"]) == [WEEKLY_JOB]
+    job = weekly["jobs"][WEEKLY_JOB]
+    assert job["runs-on"] == RUNNER_IMAGE
+    assert "permissions" not in job
+    assert all("uses" not in step for step in job["steps"])
+    assert _weekly_step()["env"]["CI_REF"] == "dev"
+
+
+def _longest_ci_chain_minutes() -> int:
+    """The longest sum of `timeout-minutes` along any chain of `needs` in ci.yml."""
+    jobs = _jobs()
+    memo: dict[str, int] = {}
+
+    def chain(job_id: str) -> int:
+        if job_id not in memo:
+            job = jobs[job_id]
+            memo[job_id] = job["timeout-minutes"] + max((chain(need) for need in _needs(job)), default=0)
+        return memo[job_id]
+
+    return max(chain(job_id) for job_id in jobs)
+
+
+def test_the_weekly_run_outlasts_the_longest_ci_run() -> None:
+    """The scheduler waits for the run it dispatched; timing out first would
+    report a failure that never happened, or hide one that did."""
+    timeout = _weekly()["jobs"][WEEKLY_JOB]["timeout-minutes"]
+    assert _longest_ci_chain_minutes() + WEEKLY_QUEUE_MARGIN_MINUTES <= timeout <= MAX_JOB_TIMEOUT_MINUTES
+
+
+def test_ci_names_a_dispatched_run_after_its_tag() -> None:
+    """The scheduler finds its own run by the tag in the run's name, so a
+    concurrent dispatch or push is never mistaken for it; every other run
+    keeps GitHub's default name, because an empty name falls back to it."""
+    workflow = _workflow()
+    assert workflow["run-name"] == RUN_TAG_RUN_NAME
+    run_tag = _triggers(workflow)["workflow_dispatch"]["inputs"]["run_tag"]
+    assert run_tag["type"] == "string" and run_tag["required"] is False and run_tag["default"] == ""
+
+
+FAKE_GH = """#!/usr/bin/env python3
+# Stands in for gh: logs each call and answers from the FAKE_* variables.
+import json, os, sys
+
+args = sys.argv[1:]
+with open(os.environ["FAKE_GH_LOG"], "a") as log:
+    log.write(json.dumps(args) + "\\n")
+tag_file = os.environ["FAKE_GH_TAG"]
+if args[:2] == ["workflow", "run"]:
+    with open(tag_file, "w") as out:
+        out.write(next(a.split("=", 1)[1] for a in args if a.startswith("run_tag=")))
+    sys.exit(0)
+if args[:2] == ["run", "list"]:
+    calls_file = os.environ["FAKE_GH_LIST_CALLS"]
+    calls = (int(open(calls_file).read()) if os.path.exists(calls_file) else 0) + 1
+    with open(calls_file, "w") as out:
+        out.write(str(calls))
+    if calls <= int(os.environ.get("FAKE_LIST_FAILS", "0")):
+        sys.exit(1)
+    # A decoy whose tag starts with ours: a plain substring match would take it.
+    runs = [{"databaseId": 11, "displayTitle": "Weekly full CI (weekly-9-10)"}]
+    if os.environ.get("FAKE_RUN_APPEARS") == "1" and os.path.exists(tag_file):
+        runs.append({"databaseId": 4242, "displayTitle": "Weekly full CI (" + open(tag_file).read() + ")"})
+    print(json.dumps(runs))
+    sys.exit(0)
+if args[:2] == ["run", "watch"]:
+    sys.exit(0)
+if args[:2] == ["run", "view"]:
+    print(os.environ["FAKE_CONCLUSION"])
+    sys.exit(0)
+sys.exit(2)
+"""
+
+
+def _run_weekly_step(tmp_path: Path, **fake: str) -> tuple[subprocess.CompletedProcess[str], list[list[str]], str]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(FAKE_GH)
+    gh.chmod(0o755)
+    log, summary = tmp_path / "gh.log", tmp_path / "summary.md"
+    step = _weekly_step()
+    env = {
+        **{key: value for key, value in step["env"].items() if not str(value).startswith("${{")},
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "GITHUB_RUN_ID": "9",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_SERVER_URL": "https://github.com",
+        "GITHUB_REPOSITORY": "owner/repo",
+        "GITHUB_STEP_SUMMARY": str(summary),
+        "FIND_TIMEOUT_SECONDS": "3",
+        "POLL_SECONDS": "0",
+        "WATCH_SECONDS": "1",
+        "FAKE_GH_LOG": str(log),
+        "FAKE_GH_TAG": str(tmp_path / "tag"),
+        "FAKE_GH_LIST_CALLS": str(tmp_path / "list-calls"),
+        **fake,
+    }
+    proc = subprocess.run(
+        ["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60, check=False
+    )
+    calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+    return proc, calls, summary.read_text() if summary.exists() else ""
+
+
+def test_the_weekly_run_passes_only_when_the_run_it_dispatched_succeeded(tmp_path: Path) -> None:
+    """It dispatches ci.yml on dev with its own tag, waits for that run (not
+    the decoy whose tag merely starts with its own), and reports its result."""
+    proc, calls, summary = _run_weekly_step(tmp_path, FAKE_RUN_APPEARS="1", FAKE_CONCLUSION="success")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert calls[0] == ["workflow", "run", "ci.yml", "--ref", "dev", "-f", "run_tag=weekly-9-1"]
+    watched = [call for call in calls if call[:2] in (["run", "watch"], ["run", "view"])]
+    assert watched and all(call[2] == "4242" for call in watched)
+    assert "success" in summary
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out", ""])
+def test_the_weekly_run_fails_unless_the_run_it_dispatched_succeeded(tmp_path: Path, conclusion: str) -> None:
+    """A failed, cancelled or unfinished run, or one whose result cannot be
+    read, turns the weekly run red; only `success` passes."""
+    proc, _, _ = _run_weekly_step(tmp_path, FAKE_RUN_APPEARS="1", FAKE_CONCLUSION=conclusion)
+    assert proc.returncode != 0
+
+
+def test_the_weekly_run_fails_when_its_run_never_appears(tmp_path: Path) -> None:
+    """If the dispatched run cannot be found, nothing was proven: fail rather
+    than watch the decoy or pass."""
+    proc, calls, _ = _run_weekly_step(tmp_path, FAKE_RUN_APPEARS="0", FAKE_CONCLUSION="success")
+    assert proc.returncode != 0
+    assert not [call for call in calls if call[:2] in (["run", "watch"], ["run", "view"])]
+
+
+def test_the_weekly_run_rides_out_a_failing_run_listing(tmp_path: Path) -> None:
+    """A transient API error while looking for the run is retried until the deadline."""
+    proc, _, _ = _run_weekly_step(tmp_path, FAKE_RUN_APPEARS="1", FAKE_CONCLUSION="success", FAKE_LIST_FAILS="2")
+    assert proc.returncode == 0, proc.stdout + proc.stderr

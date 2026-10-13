@@ -1,4 +1,7 @@
 name: ci
+# Only a run the weekly scheduler dispatched carries a tag; for every other
+# run this is empty, and GitHub falls back to its default run name.
+run-name: ${{ inputs.run_tag && format('Weekly full CI ({0})', inputs.run_tag) || '' }}
 
 on:
   push:
@@ -8,6 +11,12 @@ on:
   pull_request:
     branches: [main, dev]
   workflow_dispatch:
+    inputs:
+      run_tag:
+        description: Set by the weekly full run so it can find the run it dispatched; leave empty.
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
