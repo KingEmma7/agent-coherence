@@ -529,10 +529,10 @@ For reproducible installs with full dependency-graph pinning:
 
     pip install --require-hashes -r requirements-diagnose.txt
 
-The `requirements-diagnose.txt` file in the repo root is regenerated on each
-release via `uv export --format requirements-txt --frozen --extra diagnose
---no-emit-project --no-dev`. It pins every transitive dependency by SHA-256
-hash.
+The `requirements-diagnose.txt` file in the repo root is generated from
+`uv.lock` with `uv export --format requirements-txt --frozen --extra diagnose
+--no-emit-project --no-dev`, and the test suite fails any change that leaves
+the two disagreeing. It pins every transitive dependency by SHA-256 hash.
 
 `uv.lock` in the repo is the developer lockfile. Downstream installers should
 prefer `requirements-diagnose.txt` for reproducible installs.

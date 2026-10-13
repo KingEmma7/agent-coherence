@@ -1586,6 +1586,20 @@ Alpha — APIs may change before `v1.0`.
   instrument by design and need no fixing; where coverage is wanted, the
   tracked set has to name files git tracks.
 
+### Security
+
+- **`requirements-diagnose.txt` pins patched dependencies and installs
+  again.** It now pins `anyio` 4.15.1, `urllib3` 2.8.0, `langgraph-checkpoint`
+  4.3.0 and `langgraph-sdk` 0.4.7, past the versions named in open advisories;
+  `langgraph` moves to 1.2.15 and `langchain-core` to 1.6.10 because the older
+  `langgraph` caps `langgraph-sdk` below 0.4. An automated update had rewritten
+  pins in the file without resolving them, so on `dev`
+  `pip install --require-hashes -r requirements-diagnose.txt` failed: it pinned
+  `langgraph-sdk` 0.4.4 beside `langgraph` 1.1.10, and `langsmith` 0.8.18
+  without the `websockets` it needs. The file is regenerated from `uv.lock`, and
+  the test suite now fails any change after which the file pins a version or
+  hash `uv.lock` does not record, or lists a different set of packages.
+
 ## [0.14.1] - 2026-09-05
 
 **Four correctness fixes to the read-generation fence and the effect gate, plus the conflict-outcome instrumentation that makes a deny countable.** Every fix in this release closes a window in which a revoked or preempted writer's work was silently admitted; the instrumentation exists so the next thirty days can say how often that happens in the wild, rather than leaving it to argument.

@@ -25,6 +25,8 @@ assert the load-bearing properties this unit shipped.
 
 from __future__ import annotations
 
+import re
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -37,6 +39,14 @@ REQUIREMENTS_DIAGNOSE = REPO_ROOT / "requirements-diagnose.txt"
 SECURITY_MD = REPO_ROOT / "docs" / "security.md"
 UV_LOCK = REPO_ROOT / "uv.lock"
 README = REPO_ROOT / "README.md"
+
+# The command recorded in requirements-diagnose.txt's own header.
+REGENERATE_DIAGNOSE = (
+    "uv export --format requirements-txt --frozen --extra diagnose "
+    "--no-emit-project --no-dev > requirements-diagnose.txt"
+)
+_PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;\\]+)")
+_HASH = re.compile(r"--hash=(sha256:[0-9a-f]{64})")
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +151,100 @@ def test_requirements_diagnose_pins_load_bearing_deps(dep: str) -> None:
     # Each dep should appear with == version pin somewhere.
     assert f"\n{dep}==" in text or text.startswith(f"{dep}=="), (
         f"requirements-diagnose.txt must pin {dep}=="
+    )
+
+
+def _normalized(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _diagnose_pins() -> list[tuple[str, str, frozenset[str]]]:
+    """(name, version, hashes) for each requirement in requirements-diagnose.txt."""
+    joined = REQUIREMENTS_DIAGNOSE.read_text().replace("\\\n", " ")
+    requirements = [
+        line
+        for line in joined.splitlines()
+        if line.strip() and not line[0].isspace() and not line.startswith("#")
+    ]
+    pins = []
+    for line in requirements:
+        match = _PIN.match(line)
+        assert match, f"requirements-diagnose.txt has an unpinned line: {line[:80]!r}"
+        hashes = frozenset(_HASH.findall(line))
+        pins.append((_normalized(match[1]), match[2], hashes))
+    return pins
+
+
+def _lock_distributions() -> dict[tuple[str, str], frozenset[str]]:
+    """Each (name, version) uv.lock resolves, with every file hash it records."""
+    lock = tomllib.loads(UV_LOCK.read_text())
+    return {
+        (_normalized(package["name"]), package["version"]): frozenset(
+            dist["hash"]
+            for dist in [package.get("sdist"), *package.get("wheels", [])]
+            if dist and "hash" in dist
+        )
+        for package in lock["package"]
+        if "version" in package
+    }
+
+
+def _diagnose_closure() -> set[str]:
+    """Every package uv.lock resolves for this project's base and ``diagnose``
+    dependencies, extras followed: the set ``uv export --extra diagnose
+    --no-emit-project`` writes out."""
+    by_name: dict[str, list[dict]] = {}
+    for package in tomllib.loads(UV_LOCK.read_text())["package"]:
+        by_name.setdefault(_normalized(package["name"]), []).append(package)
+    project = _normalized("agent-coherence")
+    pending, visited, names = [(project, ("diagnose",))], set(), set()
+    while pending:
+        name, extras = pending.pop()
+        for extra in (None, *extras):
+            if (name, extra) in visited:
+                continue
+            visited.add((name, extra))
+            for package in by_name.get(name, []):
+                if extra is None:
+                    deps = package.get("dependencies", [])
+                else:
+                    deps = package.get("optional-dependencies", {}).get(extra, [])
+                for dep in deps:
+                    names.add(_normalized(dep["name"]))
+                    pending.append((_normalized(dep["name"]), tuple(dep.get("extra", ()))))
+    return names - {project}
+
+
+def test_requirements_diagnose_matches_uv_lock() -> None:
+    """The file is ``uv export`` of uv.lock, so each pin must carry the version
+    and the hashes uv.lock records. A dependency update that rewrites the pins
+    in place without resolving them leaves a file ``pip install
+    --require-hashes`` cannot install, while CI, which installs from
+    pyproject.toml, stays green."""
+    pins = _diagnose_pins()
+    assert pins, "requirements-diagnose.txt has no pinned requirements"
+    lock = _lock_distributions()
+    drifted = sorted(
+        f"{name}=={version}"
+        for name, version, hashes in pins
+        if lock.get((name, version)) != hashes
+    )
+    assert not drifted, (
+        f"requirements-diagnose.txt disagrees with uv.lock on {drifted}; "
+        f"regenerate it from uv.lock with: {REGENERATE_DIAGNOSE}"
+    )
+
+
+def test_requirements_diagnose_lists_every_locked_dependency() -> None:
+    """A pin can match uv.lock while the file still misses a package that the
+    new version needs: ``pip install --require-hashes`` then refuses the
+    unpinned dependency. The file must list exactly what uv.lock resolves."""
+    pinned = {name for name, _version, _hashes in _diagnose_pins()}
+    locked = _diagnose_closure()
+    assert pinned == locked, (
+        f"requirements-diagnose.txt is missing {sorted(locked - pinned)} and "
+        f"has extra {sorted(pinned - locked)}; regenerate it from uv.lock with: "
+        f"{REGENERATE_DIAGNOSE}"
     )
 
 
