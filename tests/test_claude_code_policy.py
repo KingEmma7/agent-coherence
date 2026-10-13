@@ -227,6 +227,9 @@ def test_non_list_top_level_rejected(root: Path, caplog: pytest.LogCaptureFixtur
         ("tracked.yaml", "just-a-string\n", "not a list"),
         ("tracked.yaml", b"- caf\xe9.md\n", "not valid YAML"),
         ("tracked.yaml", "- runbook.md\n- 2026-13-45\n", "not valid YAML"),
+        ("tracked.yaml", "- runbook.md\n- !!bool x\n", "not valid YAML"),
+        ("strict_mode.yaml", "- data/**\n- !!timestamp x\n", "not valid YAML"),
+        ("ignored.yaml", "- runbook.md\n- !!int\n", "not valid YAML"),
         ("tracked.yaml", "[" * 2000 + "]" * 2000 + "\n", "not valid YAML"),
     ],
 )
@@ -238,8 +241,8 @@ def test_a_policy_file_that_loads_as_no_entries_is_counted_as_rejected(
     Before, the only signal was a WARNING a detached coordinator sends to
     /dev/null, and /status read as a healthy workspace with no user patterns.
     Read as UTF-8 whatever the locale: bytes that are not UTF-8, an impossible
-    date and deep nesting are a file that does not load, not an exception out
-    of the loader."""
+    date, a core tag on a value it cannot take and deep nesting are a file
+    that does not load, not an exception out of the loader."""
     target = root / ".coherence" / file_name
     if isinstance(content, bytes):
         target.write_bytes(content)

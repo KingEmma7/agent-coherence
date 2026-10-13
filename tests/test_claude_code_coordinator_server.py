@@ -782,12 +782,16 @@ def test_a_policy_entry_reads_back_as_itself_beside_the_entries_already_there(
 
 
 # A file an earlier release wrote with a plain ``*``-led line, files that hold
-# no list, files PyYAML cannot load past an impossible date or deep nesting,
-# hand-written lists a block line cannot follow, and a UTF-16 file.
+# no list, files PyYAML cannot build (an impossible date, deep nesting, a core
+# tag on a value it cannot take), hand-written lists a block line cannot
+# follow, and a UTF-16 file.
 _UNAPPENDABLE_POLICY_FILES = [
     ("- runbook.md\n- *.md\n", "is not valid YAML, so it loads as no entries"),
     ("- runbook.md\n- 2026-13-45\n", "is not valid YAML, so it loads as no entries"),
     ("[" * 2000 + "]" * 2000 + "\n", "is not valid YAML, so it loads as no entries"),
+    ("- runbook.md\n- !!bool x\n", "The parser stopped: KeyError: 'x'"),
+    ("- runbook.md\n- !!timestamp x\n", "The parser stopped: AttributeError: "),
+    ("- runbook.md\n- !!int\n", "The parser stopped: IndexError: "),
     ("runbook.md\n", "holds a single string, not a list"),
     ("{runbook.md: 1}\n", "holds a mapping, not a list"),
     ("[runbook.md]\n", "cannot take a new line without breaking what it holds"),
@@ -821,6 +825,86 @@ def test_the_policy_writer_refuses_a_file_an_entry_cannot_take_effect_in(
     assert says in message and "nothing was written" in message, message
     assert 'double-quoted string such as - "*.md"' in message, message
     assert policy_file.read_bytes() == before
+
+
+def _near_cap_policy_file(policy_file: Path) -> bytes:
+    """Fill ``policy_file`` with quoted entries to just under the policy YAML
+    cap, so that one more short entry crosses it. Returns the bytes written."""
+    from ccs.adapters.claude_code.coordinator_server import MAX_POLICY_YAML_BYTES
+
+    line = '- "f00000.md"\n'
+    content = "".join(
+        f'- "f{i:05d}.md"\n' for i in range(MAX_POLICY_YAML_BYTES // len(line))
+    ).encode()
+    assert MAX_POLICY_YAML_BYTES - len('- "ok.md"\n') < len(content) <= MAX_POLICY_YAML_BYTES
+    policy_file.write_bytes(content)
+    return content
+
+
+def test_the_policy_writer_refuses_an_entry_past_the_size_cap(tmp_path: Path) -> None:
+    """The policy file cap holds after the round-trip check moved ahead of it:
+    an entry that would take the file past MAX_POLICY_YAML_BYTES is refused
+    with ValueError (the routes answer 400) and nothing is written."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / "tracked.yaml"
+    policy_file.parent.mkdir()
+    before = _near_cap_policy_file(policy_file)
+    with pytest.raises(ValueError, match="policy YAML cap of 65536 bytes would be exceeded"):
+        _append_policy_yaml(policy_file, ["ok.md"])
+    assert policy_file.read_bytes() == before
+
+
+def test_a_policy_route_answers_400_past_the_size_cap(coordinator, client: _Client) -> None:
+    """On the wire, the cap refusal is the 400 it always was, with the file
+    left as it was."""
+    policy_file = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
+    before = _near_cap_policy_file(policy_file)
+    s, b = client.post("/policy/track", {"paths": ["ok.md"]})
+    assert s == 400 and b == {"error": "policy YAML cap of 65536 bytes would be exceeded"}, b
+    assert policy_file.read_bytes() == before
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads a mode-000 file"
+)
+def test_the_policy_writer_refuses_a_file_it_cannot_read(tmp_path: Path) -> None:
+    """A policy file that exists but cannot be read is refused with
+    ValueError (the routes answer 400, as the Node coordinator does) and left
+    as it was. Read as empty, it would be replaced by a file holding only the
+    new entry; before, the route answered 500."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / "tracked.yaml"
+    policy_file.parent.mkdir()
+    policy_file.write_text("- runbook.md\n")
+    policy_file.chmod(0)
+    try:
+        with pytest.raises(ValueError) as raised:
+            _append_policy_yaml(policy_file, ["ok.md"])
+    finally:
+        policy_file.chmod(0o600)
+    assert str(raised.value) == ".coherence/tracked.yaml could not be read (EACCES); nothing was written."
+    assert policy_file.read_text() == "- runbook.md\n"
+
+
+def test_a_coordinator_over_a_broken_policy_file_counts_it_on_status(tmp_path: Path) -> None:
+    """#284 at load time: a coordinator that starts over a tracked.yaml an
+    earlier release broke serves, and /status counts the file as rejected,
+    where it used to read as a workspace with no user patterns."""
+    (tmp_path / ".coherence").mkdir()
+    (tmp_path / ".coherence" / "tracked.yaml").write_text("- data/**\n- *.md\n")
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    server.serve_in_thread()
+    time.sleep(0.05)
+    try:
+        client = _Client("127.0.0.1", server.port, load_secret(tmp_path))
+        s, b = client.get("/status")
+        assert s == 200, b
+        assert b["policy_summary"]["rejected_pattern_count"] == 1, b["policy_summary"]
+        assert b["policy_summary"]["user_added_pattern_count"] == 0, b["policy_summary"]
+    finally:
+        server.shutdown()
 
 
 @pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
@@ -2855,6 +2939,14 @@ def test_read_policy_entries_non_string_items_ignored() -> None:
     ("text", "says"),
     [
         ("{not: a list}", "holds a mapping, not a list"),
+        ("!!set {a}\n", "holds a mapping, not a list"),
+        ("runbook.md\n", "holds a single string, not a list"),
+        ("true\n", "holds a boolean, not a list"),
+        ("42\n", "holds a number, not a list"),
+        ("3.5\n", "holds a number, not a list"),
+        ("2026-10-12\n", "holds a date, not a list"),
+        ("2026-10-12 10:00:00\n", "holds a date, not a list"),
+        ("!!binary aGk=\n", "holds binary data, not a list"),
         ("- a.md\n- *.md\n", "is not valid YAML"),
         ("- a.md\n---\n- b.md\n", "more than one YAML document"),
     ],

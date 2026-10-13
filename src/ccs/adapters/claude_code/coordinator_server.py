@@ -52,6 +52,7 @@ Lifecycle (spawn, port-file, idle-shutdown, sweep) lives in :mod:`lifecycle`
 from __future__ import annotations
 
 import base64
+import errno
 import http.server
 import json
 import logging
@@ -86,6 +87,7 @@ from ccs.adapters.claude_code.auth import (
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.bash_write_detector import detect_tracked_writes
 from ccs.adapters.claude_code.policy import (
+    POLICY_LOAD_ERRORS,
     UNTRACK_STRICT_PATH_REASON,
     TrackedArtifactPolicy,
     policy_file_name,
@@ -8549,9 +8551,7 @@ def _read_policy_entries(text: str | bytes, name: str) -> list[str]:
     its own except for the parser's words."""
     try:
         raw = yaml.safe_load(text)
-    # PyYAML raises a plain ValueError for an impossible date (2026-13-45) and
-    # RecursionError for deep nesting: the body loads as no entries all the same.
-    except (yaml.YAMLError, ValueError, RecursionError) as exc:
+    except POLICY_LOAD_ERRORS as exc:
         raise ValueError(_invalid_policy_yaml_message(name, exc)) from None
     if raw is None:
         return []
@@ -8569,7 +8569,12 @@ def _invalid_policy_yaml_message(name: str, exc: Exception) -> str:
     # PyYAML quotes file content in its problem text with repr(), which escapes
     # every control, format and separator character, so the line a client
     # prints to a terminal reads as what it is.
-    problem = getattr(exc, "problem", None) or str(exc).splitlines()[0]
+    problem = getattr(exc, "problem", None)
+    if problem is None:
+        first_line = (str(exc).splitlines() or [""])[0]
+        # A safe constructor's own error (KeyError 'x' for ``!!bool x``) reads
+        # as nothing without its type.
+        problem = first_line if isinstance(exc, yaml.YAMLError) else f"{type(exc).__name__}: {first_line}"
     # PyYAML says "expected a single document in the stream" for a second ---,
     # in the context, which (unlike the problem) never quotes the file.
     if "single document" in (getattr(exc, "context", None) or ""):
@@ -8612,11 +8617,7 @@ def _append_policy_entries(yaml_path: Path, candidates: list[str]) -> list[str]:
     ``json.dumps`` does not (it writes a surrogate pair for a character past
     the BMP, and with ``ensure_ascii=False`` leaves NEL raw)."""
     name = policy_file_name(yaml_path)
-    try:
-        # Bytes: PyYAML decodes them as the writer encodes, whatever the locale.
-        data = yaml_path.read_bytes()
-    except FileNotFoundError:
-        data = b""
+    data = _read_policy_bytes(yaml_path, name)
     current = _read_policy_entries(data, name)
     already_present = set(current)
     truly_new = [p for p in candidates if p not in already_present]
@@ -8648,6 +8649,21 @@ def _append_policy_entries(yaml_path: Path, candidates: list[str]) -> list[str]:
         )
     _replace_policy_file(yaml_path, new_content)
     return truly_new
+
+
+def _read_policy_bytes(yaml_path: Path, name: str) -> bytes:
+    """The policy file's bytes (PyYAML decodes them as the writer encodes,
+    whatever the locale), or none for a missing file. Raises ValueError (the
+    routes answer 400) for any other read failure: reading it as empty would
+    replace a file holding every pattern with one holding only the new ones.
+    The text matches the Node coordinator's."""
+    try:
+        return yaml_path.read_bytes()
+    except FileNotFoundError:
+        return b""
+    except OSError as exc:
+        code = errno.errorcode.get(exc.errno, str(exc)) if exc.errno else str(exc)
+        raise ValueError(f"{name} could not be read ({code}); nothing was written.") from None
 
 
 def _entries_or_none(text: str, name: str) -> list[str] | None:

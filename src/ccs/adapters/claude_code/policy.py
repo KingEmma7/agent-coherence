@@ -854,6 +854,18 @@ def _glob_match(
     return matcher is not None and matcher(path)
 
 
+# Everything yaml.safe_load raises for a policy file it cannot build, measured
+# over the core tags and malformed values with PyYAML 6.0: YAMLError for the
+# syntax; from the safe constructors, ValueError (``!!int x``, an impossible
+# date such as 2026-13-45), LookupError (an empty ``!!int`` or ``!!float``
+# raises IndexError, ``!!bool x`` raises KeyError) and AttributeError
+# (``!!timestamp x``); and RecursionError for deep nesting. Each means the
+# file loads as no entries; the loader and the policy writer share the tuple.
+POLICY_LOAD_ERRORS: tuple[type[Exception], ...] = (
+    yaml.YAMLError, ValueError, LookupError, AttributeError, RecursionError,
+)
+
+
 def policy_file_name(yaml_path: Path) -> str:
     """How a refusal and a rejected entry name a policy file:
     ``.coherence/tracked.yaml``, as the Node coordinator names it."""
@@ -886,9 +898,7 @@ def _load_yaml_patterns(
         # the locale, as the writer encodes, and undecodable bytes are a YAML
         # error here instead of an exception out of every hook.
         raw = yaml.safe_load(yaml_path.read_bytes())
-    # PyYAML raises a plain ValueError for an impossible date (2026-13-45) and
-    # RecursionError for deep nesting: the file loads as no entries all the same.
-    except (yaml.YAMLError, ValueError, RecursionError) as exc:
+    except POLICY_LOAD_ERRORS as exc:
         logger.warning("malformed YAML at %s; falling back to defaults: %s", yaml_path, exc)
         rejected.append((name, "not valid YAML, so the file loads as no entries"))
         return []
