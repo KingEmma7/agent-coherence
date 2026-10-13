@@ -843,8 +843,10 @@ Alpha — APIs may change before `v1.0`.
   exactly as sent. The routes answer 400, naming the file and writing nothing,
   when the file does not load as a list, or when an appended line would stop
   it loading as its entries plus the new one (a `[ ... ]` list, an indented
-  list, a `...` end marker, a lone `~`). The file is replaced through a temp
-  file, so a failed write leaves it whole. This matches the Claude Code
+  list, a `...` end marker, a lone `~`), and when the file cannot be read,
+  which used to answer 500. The file is replaced through a temp file, so a
+  failed write leaves it whole; a policy file kept as a symlink becomes a
+  regular file. This matches the Claude Code
   plugin's Node coordinator, and the protocol corpus pins the refusal text and
   the idempotent repeat on both backends. Every release from 0.8.0a1 through
   0.14.1 wrote entries this way; a file one of them broke is now refused with
@@ -852,17 +854,19 @@ Alpha — APIs may change before `v1.0`.
   [Status, track and untrack commands](docs/guide.md#status-track-and-untrack-commands)
   section.
 
-- **A policy file that loads as no entries is reported (#284).** A
-  `.coherence/tracked.yaml`, `ignored.yaml` or `strict_mode.yaml` that is not
-  valid YAML, not a list or not readable used to be visible only as a log
-  warning, which a detached coordinator discards, so `/status` read as a
-  healthy workspace with no user patterns. Each such file now counts in
+- **The Python coordinator reports a policy file that loads as no entries
+  (#284).** A `.coherence/tracked.yaml`, `ignored.yaml` or `strict_mode.yaml`
+  that is not valid YAML, not a list or not readable used to be visible only
+  as a log warning, which a detached coordinator discards, so `/status` read
+  as a healthy workspace with no user patterns. Each such file now counts in
   `policy_summary.rejected_pattern_count`, named by its `.coherence/` path, and
   `agent-coherence-status` adds `, N rejected` to its Policy line when there
-  are any. Policy files are decoded the same way whatever the locale. A file
+  are any. The Claude Code plugin's Node coordinator does not count such a
+  file yet. Policy files are decoded the same way whatever the locale. A file
   whose bytes are not UTF-8, or that holds an impossible date such as
-  `2026-13-45` or very deep nesting, counts as a file that does not load
-  instead of raising out of the policy load.
+  `2026-13-45`, a core tag on a value it cannot take such as `!!bool x`, or
+  very deep nesting, counts as a file that does not load. Such a file used to
+  raise out of the policy load, so the coordinator could not start.
 
 - **The release workflow refuses a development version and publishes
   pre-releases as pre-releases (#295).** A `v*` tag naming a development
