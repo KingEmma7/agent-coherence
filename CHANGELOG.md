@@ -834,6 +834,52 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **Tracking or untracking a glob such as `*.md` no longer empties the policy
+  file (#284).** `POST /policy/track` and `/policy/untrack` (the track and
+  untrack commands) wrote each entry as a plain YAML line. An entry the path
+  check admits but YAML reads as something else stopped the whole file
+  parsing: an alias (`*.md`, `**`), a flow collection (`[abc].md`,
+  `{a,b}.md`), or a tag, directive, block-scalar or quote indicator. The
+  coordinator then loaded the file as no entries, while the request answered
+  `ok` with the entry `added`. Other entries loaded as a different string
+  (`a #b` as `a`, `&x data/**` as `data/**`), as a non-string (`yes`, `010`,
+  `2026-10-12`), or as two entries (a path holding a NEL or line separator).
+  Without strict mode, the live policy dropped every user-added tracked entry
+  at once, and an untrack dropped every ignore. With strict mode, the loss came
+  at the next coordinator start: a strict path whose tracked entry was in the
+  file left strict mode and took the untracked fast path, where a stale CAS
+  overwrote a newer version with nothing raised, while `/status` still counted
+  the strict pattern (#261). Each repeat appended the entry again and answered
+  `added` again, until the 64 KiB cap refused every track and untrack.
+  Entries are now written as double-quoted YAML strings, which load back
+  exactly as sent. The routes answer 400, naming the file and writing nothing,
+  when the file does not load as a list, or when an appended line would stop
+  it loading as its entries plus the new one (a `[ ... ]` list, an indented
+  list, a `...` end marker, a lone `~`), and when the file cannot be read,
+  which used to answer 500. The file is replaced through a temp file, so a
+  failed write leaves it whole; a policy file kept as a symlink becomes a
+  regular file. This matches the Claude Code
+  plugin's Node coordinator, and the protocol corpus pins the refusal text and
+  the idempotent repeat on both backends. Every release from 0.8.0a1 through
+  0.14.1 wrote entries this way; a file one of them broke is now refused with
+  a rewrite hint instead of appended to. See the guide's
+  [Status, track and untrack commands](docs/guide.md#status-track-and-untrack-commands)
+  section.
+
+- **The Python coordinator reports a policy file that loads as no entries
+  (#284).** A `.coherence/tracked.yaml`, `ignored.yaml` or `strict_mode.yaml`
+  that is not valid YAML, not a list or not readable used to be visible only
+  as a log warning, which a detached coordinator discards, so `/status` read
+  as a healthy workspace with no user patterns. Each such file now counts in
+  `policy_summary.rejected_pattern_count`, named by its `.coherence/` path, and
+  `agent-coherence-status` adds `, N rejected` to its Policy line when there
+  are any. The Claude Code plugin's Node coordinator does not count such a
+  file yet. Policy files are decoded the same way whatever the locale. A file
+  whose bytes are not UTF-8, or that holds an impossible date such as
+  `2026-13-45`, a core tag on a value it cannot take such as `!!bool x`, or
+  very deep nesting, counts as a file that does not load. Such a file used to
+  raise out of the policy load, so the coordinator could not start.
+
 - **The release workflow refuses a development version and publishes
   pre-releases as pre-releases (#295).** A `v*` tag naming a development
   version (`.devN`, which `dev` now reports) used to pass the release

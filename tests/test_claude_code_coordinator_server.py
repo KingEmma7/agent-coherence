@@ -25,6 +25,7 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 import pytest
+import yaml
 
 from ccs.adapters.claude_code import policy as policy_module
 from ccs.adapters.claude_code.auth import load_secret
@@ -715,6 +716,212 @@ def test_policy_untrack_persists_to_ignored_yaml(coordinator, client: _Client) -
     assert not coordinator.policy.is_tracked("docs/brainstorms/draft.md")
 
 
+# Entries the path validator accepts that YAML reads as something else when
+# written as a plain ``- <entry>`` line: an alias, tag, directive, block scalar,
+# flow collection, unclosed quote or stray indicator stops the whole file
+# parsing, so it loads as no entries (#284); a comment, anchor or mapping key
+# loads a different string; a bool, number, null or date loads a non-string;
+# and NEL or LS splits one entry into two lines. Plus characters a quoted
+# scalar must escape.
+_YAML_SIGNIFICANT_ENTRIES = [
+    "*.md", "**", "[abc].md", "{a,b}.md", "!x.md", "%x", "@x", "`x", "|x", ">x",
+    "'x", '"x', ",x", "a b", "x - **", "a #b", "&x data/**", "a: b", "? x",
+    "yes", "null", "010", "2026-10-12", "zz\x85- src/**", "a\u2028b", "a\x80b",
+    "\U0001f600.md", 'x"y', "a\\b", " lead", "trail ",
+]
+
+_POLICY_FILES = [
+    ("/policy/track", "tracked.yaml", "added", "user_added_patterns"),
+    ("/policy/untrack", "ignored.yaml", "removed", "ignored_patterns"),
+]
+
+
+@pytest.mark.parametrize(("file_name", "loaded_as"), [
+    ("tracked.yaml", "user_added_patterns"), ("ignored.yaml", "ignored_patterns"),
+])
+@pytest.mark.parametrize("entry", _YAML_SIGNIFICANT_ENTRIES)
+def test_the_policy_writer_appends_an_entry_that_reads_back_as_itself(
+    tmp_path: Path, file_name: str, loaded_as: str, entry: str
+) -> None:
+    """#284: the writer behind /policy/track and /policy/untrack appends an
+    entry that loads back as exactly the string it was given, and the entries
+    already in the file still load beside it. A plain ``- *.md`` line stopped
+    the file parsing, which loads as no entries, so the route answered
+    ``added`` while the coordinator dropped every entry."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / file_name
+    policy_file.parent.mkdir()
+    policy_file.write_text("- runbook.md\n")
+    assert _append_policy_yaml(policy_file, [entry]) == ([entry], [])
+    assert yaml.safe_load(policy_file.read_bytes()) == ["runbook.md", entry]
+    loaded = policy_module.TrackedArtifactPolicy.load(tmp_path)
+    assert getattr(loaded, loaded_as) == ("runbook.md", entry)
+
+
+@pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
+@pytest.mark.parametrize("entry", ["*.md", "zz\x85- src/**"])
+def test_a_policy_entry_reads_back_as_itself_beside_the_entries_already_there(
+    coordinator, client: _Client, endpoint: str, file_name: str, answer_key: str,
+    loaded_as: str, entry: str,
+) -> None:
+    """#284, on the wire: the entry a track or untrack writes loads back as
+    exactly the string it was sent, beside the entries already in the file, in
+    the live policy at once and in a fresh load as after a restart."""
+    root = coordinator.coordinator_root
+    policy_file = root / ".coherence" / file_name
+    policy_file.write_text("- runbook.md\n")
+    s, b = client.post(endpoint, {"paths": [entry]})
+    assert s == 200 and b == {"ok": True, answer_key: [entry], "rejected": []}, b
+    assert yaml.safe_load(policy_file.read_bytes()) == ["runbook.md", entry]
+    assert getattr(coordinator.policy, loaded_as) == ("runbook.md", entry)
+    loaded = policy_module.TrackedArtifactPolicy.load(root)
+    assert getattr(loaded, loaded_as) == ("runbook.md", entry)
+
+
+# A file an earlier release wrote with a plain ``*``-led line, files that hold
+# no list, files PyYAML cannot build (an impossible date, deep nesting, a core
+# tag on a value it cannot take), hand-written lists a block line cannot
+# follow, and a UTF-16 file.
+_UNAPPENDABLE_POLICY_FILES = [
+    ("- runbook.md\n- *.md\n", "is not valid YAML, so it loads as no entries"),
+    ("- runbook.md\n- 2026-13-45\n", "is not valid YAML, so it loads as no entries"),
+    ("[" * 2000 + "]" * 2000 + "\n", "is not valid YAML, so it loads as no entries"),
+    ("- runbook.md\n- !!bool x\n", "The parser stopped: KeyError: 'x'"),
+    ("- runbook.md\n- !!timestamp x\n", "The parser stopped: AttributeError: "),
+    ("- runbook.md\n- !!int\n", "The parser stopped: IndexError: "),
+    ("runbook.md\n", "holds a single string, not a list"),
+    ("{runbook.md: 1}\n", "holds a mapping, not a list"),
+    ("[runbook.md]\n", "cannot take a new line without breaking what it holds"),
+    ("  - runbook.md\n", "cannot take a new line without breaking what it holds"),
+    ("- runbook.md\n...\n", "cannot take a new line without breaking what it holds"),
+    ("~\n", "cannot take a new line without breaking what it holds"),
+    ("- runbook.md\n".encode("utf-16"), "is not UTF-8 text, so it cannot take a new line"),
+]
+
+
+@pytest.mark.parametrize("file_name", ["tracked.yaml", "ignored.yaml"])
+@pytest.mark.parametrize(("content", "says"), _UNAPPENDABLE_POLICY_FILES)
+def test_the_policy_writer_refuses_a_file_an_entry_cannot_take_effect_in(
+    tmp_path: Path, file_name: str, content: str | bytes, says: str
+) -> None:
+    """#284: when the file does not load as a list, or would stop loading as
+    its entries plus the new one, the writer raises ValueError (the routes
+    answer 400) naming the file and how to rewrite it, and writes nothing.
+    Appending to such a file answered ``ok`` for an entry that never applied,
+    again on every retry."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / file_name
+    policy_file.parent.mkdir()
+    before = content if isinstance(content, bytes) else content.encode()
+    policy_file.write_bytes(before)
+    with pytest.raises(ValueError) as raised:
+        _append_policy_yaml(policy_file, ["ok.md"])
+    message = str(raised.value)
+    assert message.startswith(f".coherence/{file_name} "), message
+    assert says in message and "nothing was written" in message, message
+    assert 'double-quoted string such as - "*.md"' in message, message
+    assert policy_file.read_bytes() == before
+
+
+def _near_cap_policy_file(policy_file: Path) -> bytes:
+    """Fill ``policy_file`` with quoted entries to just under the policy YAML
+    cap, so that one more short entry crosses it. Returns the bytes written."""
+    from ccs.adapters.claude_code.coordinator_server import MAX_POLICY_YAML_BYTES
+
+    line = '- "f00000.md"\n'
+    content = "".join(
+        f'- "f{i:05d}.md"\n' for i in range(MAX_POLICY_YAML_BYTES // len(line))
+    ).encode()
+    assert MAX_POLICY_YAML_BYTES - len('- "ok.md"\n') < len(content) <= MAX_POLICY_YAML_BYTES
+    policy_file.write_bytes(content)
+    return content
+
+
+def test_the_policy_writer_refuses_an_entry_past_the_size_cap(tmp_path: Path) -> None:
+    """The policy file cap holds after the round-trip check moved ahead of it:
+    an entry that would take the file past MAX_POLICY_YAML_BYTES is refused
+    with ValueError (the routes answer 400) and nothing is written."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / "tracked.yaml"
+    policy_file.parent.mkdir()
+    before = _near_cap_policy_file(policy_file)
+    with pytest.raises(ValueError, match="policy YAML cap of 65536 bytes would be exceeded"):
+        _append_policy_yaml(policy_file, ["ok.md"])
+    assert policy_file.read_bytes() == before
+
+
+def test_a_policy_route_answers_400_past_the_size_cap(coordinator, client: _Client) -> None:
+    """On the wire, the cap refusal is the 400 it always was, with the file
+    left as it was."""
+    policy_file = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
+    before = _near_cap_policy_file(policy_file)
+    s, b = client.post("/policy/track", {"paths": ["ok.md"]})
+    assert s == 400 and b == {"error": "policy YAML cap of 65536 bytes would be exceeded"}, b
+    assert policy_file.read_bytes() == before
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads a mode-000 file"
+)
+def test_the_policy_writer_refuses_a_file_it_cannot_read(tmp_path: Path) -> None:
+    """A policy file that exists but cannot be read is refused with
+    ValueError (the routes answer 400, as the Node coordinator does) and left
+    as it was. Read as empty, it would be replaced by a file holding only the
+    new entry; before, the route answered 500."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / "tracked.yaml"
+    policy_file.parent.mkdir()
+    policy_file.write_text("- runbook.md\n")
+    policy_file.chmod(0)
+    try:
+        with pytest.raises(ValueError) as raised:
+            _append_policy_yaml(policy_file, ["ok.md"])
+    finally:
+        policy_file.chmod(0o600)
+    assert str(raised.value) == ".coherence/tracked.yaml could not be read (EACCES); nothing was written."
+    assert policy_file.read_text() == "- runbook.md\n"
+
+
+def test_a_coordinator_over_a_broken_policy_file_counts_it_on_status(tmp_path: Path) -> None:
+    """#284 at load time: a coordinator that starts over a tracked.yaml an
+    earlier release broke serves, and /status counts the file as rejected,
+    where it used to read as a workspace with no user patterns."""
+    (tmp_path / ".coherence").mkdir()
+    (tmp_path / ".coherence" / "tracked.yaml").write_text("- data/**\n- *.md\n")
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    server.serve_in_thread()
+    time.sleep(0.05)
+    try:
+        client = _Client("127.0.0.1", server.port, load_secret(tmp_path))
+        s, b = client.get("/status")
+        assert s == 200, b
+        assert b["policy_summary"]["rejected_pattern_count"] == 1, b["policy_summary"]
+        assert b["policy_summary"]["user_added_pattern_count"] == 0, b["policy_summary"]
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
+def test_a_policy_file_an_entry_cannot_take_effect_in_is_refused_untouched(
+    coordinator, client: _Client, endpoint: str, file_name: str, answer_key: str,
+    loaded_as: str,
+) -> None:
+    """#284, on the wire: a file an earlier release broke with a plain
+    ``- *.md`` line is refused with HTTP 400 naming the file, and left as it
+    was, where the route used to append to it and answer ``ok``."""
+    policy_file = coordinator.coordinator_root / ".coherence" / file_name
+    policy_file.write_text("- runbook.md\n- *.md\n")
+    s, b = client.post(endpoint, {"paths": ["ok.md"]})
+    assert s == 400, b
+    assert b["error"].startswith(f".coherence/{file_name} is not valid YAML"), b
+    assert "nothing was written" in b["error"], b
+    assert policy_file.read_text() == "- runbook.md\n- *.md\n"
+
+
 @pytest.fixture
 def strict_coordinator(tmp_path: Path):
     """A live coordinator whose policy holds ``data/**`` tracked and strict."""
@@ -840,6 +1047,50 @@ def test_a_stale_cas_on_a_strict_path_ignored_at_spawn_conflicts(tmp_path: Path)
         })
         assert s == 200 and b.get("ok") is False, b
         assert _artifact_version(server, "data/x.json") == v + 1
+    finally:
+        server.shutdown()
+
+
+def test_a_glob_led_track_keeps_a_strict_path_enforced_after_a_restart(tmp_path: Path) -> None:
+    """#284 + #261: tracking a ``*``-led glob on a coordinator that holds
+    ``data/**`` strict leaves the strict path enforced by the next coordinator
+    on the workspace. The plain ``- *.md`` line stopped tracked.yaml parsing,
+    so after a restart ``data/**`` was no longer tracked, strict mode (which
+    needs tracked) no longer applied, and a stale CAS at expected_version 0
+    overwrote a newer commit with nothing raised."""
+    (tmp_path / ".coherence").mkdir()
+    (tmp_path / ".coherence" / "tracked.yaml").write_text("- data/**\n")
+    (tmp_path / ".coherence" / "strict_mode.yaml").write_text("- data/**\n")
+    first = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    first.serve_in_thread()
+    time.sleep(0.05)
+    try:
+        client = _Client("127.0.0.1", first.port, load_secret(tmp_path))
+        s, b = client.post("/policy/track", {"paths": ["*.md"]})
+        assert s == 200 and b["added"] == ["*.md"], b
+    finally:
+        first.shutdown()
+
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    server.serve_in_thread()
+    time.sleep(0.05)
+    try:
+        client = _Client("127.0.0.1", server.port, load_secret(tmp_path))
+        writer = _sid("restart-writer")
+        v = _occ_seed_shared(client, writer, "data/x.json", _hash("restart-v1"))
+        s, b = client.post("/hooks/post-edit-cas", {
+            "session_id": writer, "path": "data/x.json", "success": True,
+            "content_hash": _hash("restart-v2"), "expected_version": v,
+        })
+        assert s == 200 and b == {"ok": True, "version": v + 1}, b
+        s, b = client.post("/hooks/post-edit-cas", {
+            "session_id": _sid("restart-peer"), "path": "data/x.json", "success": True,
+            "content_hash": _hash("restart-stale"), "expected_version": 0,
+        })
+        assert s == 200 and b.get("ok") is False, b
+        assert _artifact_version(server, "data/x.json") == v + 1
+        assert server.policy.is_strict_mode("data/x.json")
+        assert server.policy.is_tracked("notes.md")
     finally:
         server.shutdown()
 
@@ -2629,9 +2880,9 @@ def test_r14_concurrent_policy_track_no_lost_writes(coordinator, client: _Client
     assert accepted, f"no requests succeeded — KTD-G cap may be too tight: {results}"
 
     yaml_path = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
-    text = yaml_path.read_text()
+    entries = yaml.safe_load(yaml_path.read_bytes())
     for p in accepted:
-        assert f"- {p}" in text, (
+        assert p in entries, (
             f"path {p!r} lost despite 200 response — fcntl.flock did not serialize"
         )
 
@@ -2646,11 +2897,15 @@ def test_r14_lock_file_created_next_to_yaml(coordinator, client: _Client) -> Non
     assert lock_path.is_file(), "tracked.yaml.lock sidecar was not created"
 
 
-def test_policy_track_idempotent_no_duplicate_entries(coordinator, client: _Client) -> None:
+@pytest.mark.parametrize("path", ["idempotent_test.md", "*.md"])
+def test_policy_track_idempotent_no_duplicate_entries(
+    coordinator, client: _Client, path: str
+) -> None:
     """Tracking the same path twice must not produce duplicate lines in
     tracked.yaml. The second call should still return 200 (idempotent) but
-    the path must appear exactly once in the YAML."""
-    path = "idempotent_test.md"
+    the path must appear exactly once in the YAML. A ``*``-led entry once
+    made the file unreadable to the dedupe, so every repeat appended again
+    and answered ``added`` again (#284)."""
     s1, b1 = client.post("/policy/track", {"paths": [path]})
     s2, b2 = client.post("/policy/track", {"paths": [path]})
     assert s1 == 200
@@ -2663,8 +2918,7 @@ def test_policy_track_idempotent_no_duplicate_entries(coordinator, client: _Clie
     )
 
     yaml_path = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
-    text = yaml_path.read_text()
-    occurrences = text.count(f"- {path}")
+    occurrences = (yaml.safe_load(yaml_path.read_bytes()) or []).count(path)
     assert occurrences == 1, (
         f"path {path!r} appears {occurrences}\xd7 in tracked.yaml after two track calls "
         f"(expected 1 \u2014 /policy/track must be idempotent)"
@@ -2672,46 +2926,117 @@ def test_policy_track_idempotent_no_duplicate_entries(coordinator, client: _Clie
 
 
 # ----------------------------------------------------------------------
-# _parse_yaml_pattern_lines unit tests
+# _read_policy_entries unit tests
 # ----------------------------------------------------------------------
 
 
-def test_parse_yaml_pattern_lines_plain_entries() -> None:
-    """Plain unquoted list items are extracted."""
-    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
+def test_read_policy_entries_plain_entries() -> None:
+    """Plain unquoted list items are extracted, in file order."""
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_entries
     text = "- plan.md\n- src/main.py\n"
-    result = _parse_yaml_pattern_lines(text)
-    assert result == {"plan.md", "src/main.py"}
+    assert _read_policy_entries(text, ".coherence/tracked.yaml") == ["plan.md", "src/main.py"]
 
 
-def test_parse_yaml_pattern_lines_quoted_entries() -> None:
+def test_read_policy_entries_quoted_entries() -> None:
     """YAML-quoted values are extracted without the quotes."""
-    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_entries
     text = '- "plan.md"\n- \'src/main.py\'\n'
-    result = _parse_yaml_pattern_lines(text)
-    assert result == {"plan.md", "src/main.py"}
+    assert _read_policy_entries(text, ".coherence/tracked.yaml") == ["plan.md", "src/main.py"]
 
 
-def test_parse_yaml_pattern_lines_empty_input() -> None:
-    """Empty or whitespace-only input returns empty set."""
-    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
-    assert _parse_yaml_pattern_lines("") == set()
-    assert _parse_yaml_pattern_lines("   \n  ") == set()
+def test_read_policy_entries_empty_input() -> None:
+    """Empty or whitespace-only input, and a null document, read as no entries."""
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_entries
+    assert _read_policy_entries("", ".coherence/tracked.yaml") == []
+    assert _read_policy_entries("   \n  ", ".coherence/tracked.yaml") == []
+    assert _read_policy_entries("~\n", ".coherence/tracked.yaml") == []
 
 
-def test_parse_yaml_pattern_lines_non_string_items_ignored() -> None:
-    """Non-string items (numbers, null) are silently dropped."""
-    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
+def test_read_policy_entries_non_string_items_ignored() -> None:
+    """Non-string items (numbers, null) are dropped, as the loader drops them."""
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_entries
     text = "- plan.md\n- 42\n- null\n"
-    result = _parse_yaml_pattern_lines(text)
-    assert result == {"plan.md"}
+    assert _read_policy_entries(text, ".coherence/tracked.yaml") == ["plan.md"]
 
 
-def test_parse_yaml_pattern_lines_malformed_yaml_returns_empty() -> None:
-    """Malformed YAML falls back to empty set rather than raising."""
-    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
-    result = _parse_yaml_pattern_lines("{not: a list}")
-    assert result == set()
+@pytest.mark.parametrize(
+    ("text", "says"),
+    [
+        ("{not: a list}", "holds a mapping, not a list"),
+        ("!!set {a}\n", "holds a mapping, not a list"),
+        ("runbook.md\n", "holds a single string, not a list"),
+        ("true\n", "holds a boolean, not a list"),
+        ("42\n", "holds a number, not a list"),
+        ("3.5\n", "holds a number, not a list"),
+        ("2026-10-12\n", "holds a date, not a list"),
+        ("2026-10-12 10:00:00\n", "holds a date, not a list"),
+        ("!!binary aGk=\n", "holds binary data, not a list"),
+        ("- a.md\n- *.md\n", "is not valid YAML"),
+        ("- a.md\n---\n- b.md\n", "more than one YAML document"),
+    ],
+)
+def test_read_policy_entries_refuses_a_file_that_loads_as_no_entries(text: str, says: str) -> None:
+    """A file that is not valid YAML, or not a list, loads as no entries: the
+    helper raises ValueError (the routes answer 400) naming the file, where it
+    once returned an empty set and the writer appended to the broken file
+    (#284)."""
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_entries
+    with pytest.raises(ValueError, match="nothing was written") as raised:
+        _read_policy_entries(text, ".coherence/tracked.yaml")
+    assert str(raised.value).startswith(".coherence/tracked.yaml ")
+    assert says in str(raised.value)
+
+
+def test_read_policy_entries_blames_extra_documents_only_for_a_second_document() -> None:
+    """The refusal says the file holds more than one YAML document only when
+    it does. The parser's problem text quotes file content, so a tag that
+    decodes to "single document" in a one-document file must not be read as
+    that diagnosis."""
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_entries
+    with pytest.raises(ValueError) as raised:
+        _read_policy_entries("- !single%20document x\n", ".coherence/tracked.yaml")
+    assert "single document" in str(raised.value)
+    assert "more than one YAML document" not in str(raised.value)
+    assert "An unclosed quote or bracket" in str(raised.value)
+
+
+@pytest.mark.parametrize("hidden", ["\u202e", "\u200b", "\x85", "\u2028", "\U000e0041"])
+def test_read_policy_entries_refusal_prints_no_raw_hidden_character(hidden: str) -> None:
+    """The refusal quotes the parser's reason, which quotes file content, and
+    clients print it to a terminal: a bidi override, zero-width or separator
+    character from the file appears escaped, never raw, so the printed line
+    reads as what it is."""
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_entries
+    with pytest.raises(ValueError) as raised:
+        _read_policy_entries(f"- a.md\n- *{hidden}x\n", ".coherence/tracked.yaml")
+    message = str(raised.value)
+    assert "is not valid YAML" in message
+    assert hidden not in message, message
+
+
+def test_a_policy_write_that_fails_leaves_the_file_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The writer stages the new file beside the old one and renames it over:
+    a write that fails leaves the old file as it was and no temp file behind.
+    A truncating write in place could leave the file empty, which loads as no
+    entries."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / "tracked.yaml"
+    policy_file.parent.mkdir()
+    policy_file.write_text("- runbook.md\n")
+
+    def fail(*_args: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "replace", fail)
+    with pytest.raises(OSError, match="No space left"):
+        _append_policy_yaml(policy_file, ["*.md"])
+    assert policy_file.read_text() == "- runbook.md\n"
+    assert sorted(p.name for p in policy_file.parent.iterdir()) == [
+        "tracked.yaml", "tracked.yaml.lock",
+    ]
 
 
 # ----------------------------------------------------------------------

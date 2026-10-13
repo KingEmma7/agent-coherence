@@ -564,11 +564,18 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
         default_n = policy.get("default_pattern_count", 0)
         user_n = policy.get("user_added_pattern_count", 0)
         ignored_n = policy.get("ignored_pattern_count", 0)
+        # Shown only when non-zero, so the usual line is unchanged. A policy
+        # file that loads as no entries counts here (#284): without the count,
+        # an emptied tracked.yaml read as a workspace with no user patterns.
+        rejected_n = policy.get("rejected_pattern_count", 0)
+        rejected_suffix = (
+            "" if rejected_n in (0, None) else f", {escape_nonprintable(rejected_n)} rejected"
+        )
         print(
             "Policy: "
             f"{escape_nonprintable(default_n)} default pattern(s), "
             f"{escape_nonprintable(user_n)} user-added, "
-            f"{escape_nonprintable(ignored_n)} ignored"
+            f"{escape_nonprintable(ignored_n)} ignored{rejected_suffix}"
         )
         print()
 

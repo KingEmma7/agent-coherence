@@ -98,6 +98,8 @@ from typing import Any, Iterator, Optional
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures"
 HARNESS_TIMEOUT_SEC = 10.0
@@ -728,8 +730,9 @@ def apply_setup(workspace: Path, setup: dict[str, Any]) -> None:
         target.write_text(contents)
 
     # YAML loaders for tracked/ignored/strict_mode all accept a top-level
-    # list of patterns. Write the simplest valid shape that
-    # TrackedArtifactPolicy.load accepts.
+    # list of patterns. Double-quoted, as both coordinators write them: a
+    # plain ``- *.md`` line stops the file parsing, and both backends would
+    # then seed an empty policy without a word (#284).
     for setup_key, yaml_file in (
         ("tracked", "tracked.yaml"),
         ("ignored", "ignored.yaml"),
@@ -738,7 +741,11 @@ def apply_setup(workspace: Path, setup: dict[str, Any]) -> None:
         patterns = setup.get(setup_key) or []
         if patterns:
             (coherence_dir / yaml_file).write_text(
-                "\n".join(f"- {p}" for p in patterns) + "\n"
+                yaml.safe_dump(
+                    patterns, default_style='"', default_flow_style=False,
+                    allow_unicode=True, width=float("inf"),
+                ),
+                encoding="utf-8",
             )
 
 
