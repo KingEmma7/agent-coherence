@@ -26,13 +26,15 @@ jobs:
 
     steps:
       # The tag goes into the dispatched run's name, so the run found below is
-      # this run's own and never a concurrent dispatch or push.
+      # this run's own and never a concurrent dispatch or push. That name is
+      # the contract with ci.yml's `run-name`.
       - name: Dispatch ci.yml on dev and wait for that run
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           CI_REF: dev
           FIND_TIMEOUT_SECONDS: "300"
+          WAIT_TIMEOUT_SECONDS: "3000"
           POLL_SECONDS: "10"
           WATCH_SECONDS: "60"
         run: |
@@ -56,8 +58,24 @@ jobs:
           fi
           url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run_id"
           echo "Dispatched ci.yml on $CI_REF: $url"
-          gh run watch "$run_id" --interval "$WATCH_SECONDS" > /dev/null 2>&1 || true
-          conclusion=$(gh run view "$run_id" --json conclusion --jq .conclusion || true)
+          # `gh run watch` also returns when an API call fails mid-run, so the
+          # run's own status decides whether it is over; watch again until then.
+          state=""
+          wait_deadline=$(( $(date +%s) + WAIT_TIMEOUT_SECONDS ))
+          while :; do
+            gh run watch "$run_id" --interval "$WATCH_SECONDS" > /dev/null 2>&1 || true
+            state=$(gh run view "$run_id" --json status,conclusion --jq '.status + " " + .conclusion' 2>/dev/null || true)
+            case "$state" in completed\ *) break ;; esac
+            [ "$(date +%s)" -lt "$wait_deadline" ] || break
+            sleep "$POLL_SECONDS"
+          done
+          case "$state" in
+            completed\ *) conclusion=${state#completed } ;;
+            *)
+              echo "Weekly full CI on \`$CI_REF\`: [still running or unreadable]($url)" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::The weekly ci.yml run on $CI_REF was still running or unreadable after ${WAIT_TIMEOUT_SECONDS}s: $url"
+              exit 1 ;;
+          esac
           echo "Weekly full CI on \`$CI_REF\`: [${conclusion:-unknown}]($url)" >> "$GITHUB_STEP_SUMMARY"
           if [ "$conclusion" != success ]; then
             echo "::error::The weekly ci.yml run on $CI_REF ended ${conclusion:-with no readable result}: $url"

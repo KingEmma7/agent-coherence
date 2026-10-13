@@ -563,7 +563,12 @@ def test_the_weekly_run_can_only_dispatch_and_read_runs() -> None:
     assert job["runs-on"] == RUNNER_IMAGE
     assert "permissions" not in job
     assert all("uses" not in step for step in job["steps"])
-    assert _weekly_step()["env"]["CI_REF"] == "dev"
+    env = _weekly_step()["env"]
+    assert env["CI_REF"] == "dev"
+    # The workflow token is what `permissions` limits, and its failure is what
+    # notifies the last editor of the schedule; a stored token would bypass both.
+    assert env["GH_TOKEN"] == "${{ github.token }}"
+    assert env["GH_REPO"] == "${{ github.repository }}"
 
 
 def _longest_ci_chain_minutes() -> int:
@@ -581,10 +586,14 @@ def _longest_ci_chain_minutes() -> int:
 
 
 def test_the_weekly_run_outlasts_the_longest_ci_run() -> None:
-    """The scheduler waits for the run it dispatched; timing out first would
-    report a failure that never happened, or hide one that did."""
+    """The scheduler waits for the run it dispatched. Its own wait must cover
+    the longest CI run plus queue time, and finish before the job's timeout,
+    so a slow run ends with the scheduler's own message instead of a kill."""
+    env = _weekly_step()["env"]
+    find_seconds, wait_seconds = int(env["FIND_TIMEOUT_SECONDS"]), int(env["WAIT_TIMEOUT_SECONDS"])
+    assert wait_seconds >= (_longest_ci_chain_minutes() + WEEKLY_QUEUE_MARGIN_MINUTES) * 60
     timeout = _weekly()["jobs"][WEEKLY_JOB]["timeout-minutes"]
-    assert _longest_ci_chain_minutes() + WEEKLY_QUEUE_MARGIN_MINUTES <= timeout <= MAX_JOB_TIMEOUT_MINUTES
+    assert (find_seconds + wait_seconds) / 60 + 1 <= timeout <= MAX_JOB_TIMEOUT_MINUTES
 
 
 def test_ci_names_a_dispatched_run_after_its_tag() -> None:
@@ -597,35 +606,70 @@ def test_ci_names_a_dispatched_run_after_its_tag() -> None:
     assert run_tag["type"] == "string" and run_tag["required"] is False and run_tag["default"] == ""
 
 
+def _dispatched_title_format() -> str:
+    """The title ci.yml gives a tagged run, read from ci.yml itself, so the
+    fake below can only answer with names the real workflow produces."""
+    match = re.search(r"format\('([^']*\{0\}[^']*)'", _workflow()["run-name"])
+    assert match, _workflow()["run-name"]
+    return match.group(1)
+
+
 FAKE_GH = """#!/usr/bin/env python3
-# Stands in for gh: logs each call and answers from the FAKE_* variables.
+# Stands in for gh. Each call must have the exact shape the step uses, or
+# the fake exits 2. The dispatched run is in progress until a `run watch`
+# succeeds; a watch listed as failing in FAKE_WATCH_EXITS leaves it running.
 import json, os, sys
 
 args = sys.argv[1:]
 with open(os.environ["FAKE_GH_LOG"], "a") as log:
     log.write(json.dumps(args) + "\\n")
-tag_file = os.environ["FAKE_GH_TAG"]
+tag_file, state_file = os.environ["FAKE_GH_TAG"], os.environ["FAKE_GH_STATE"]
+title = os.environ["FAKE_TITLE_FORMAT"].replace("{0}", "%s")
+
+
+def bump(name):
+    path = os.environ["FAKE_GH_DIR"] + "/" + name
+    count = (int(open(path).read()) if os.path.exists(path) else 0) + 1
+    with open(path, "w") as out:
+        out.write(str(count))
+    return count
+
+
 if args[:2] == ["workflow", "run"]:
     with open(tag_file, "w") as out:
         out.write(next(a.split("=", 1)[1] for a in args if a.startswith("run_tag=")))
     sys.exit(0)
 if args[:2] == ["run", "list"]:
-    calls_file = os.environ["FAKE_GH_LIST_CALLS"]
-    calls = (int(open(calls_file).read()) if os.path.exists(calls_file) else 0) + 1
-    with open(calls_file, "w") as out:
-        out.write(str(calls))
-    if calls <= int(os.environ.get("FAKE_LIST_FAILS", "0")):
+    expected = ["--workflow", "ci.yml", "--branch", "dev", "--event", "workflow_dispatch"]
+    if any(args[args.index(flag) + 1] != value for flag, value in zip(expected[::2], expected[1::2]) if flag in args) \\
+            or not all(flag in args for flag in expected[::2]):
+        sys.exit(2)
+    fields = args[args.index("--json") + 1].split(",") if "--json" in args else []
+    if not {"databaseId", "displayTitle"} <= set(fields):
+        sys.exit(2)
+    if bump("list-calls") <= int(os.environ.get("FAKE_LIST_FAILS", "0")):
         sys.exit(1)
     # A decoy whose tag starts with ours: a plain substring match would take it.
-    runs = [{"databaseId": 11, "displayTitle": "Weekly full CI (weekly-9-10)"}]
+    runs = [{"databaseId": 11, "displayTitle": title % "weekly-9-10"}]
     if os.environ.get("FAKE_RUN_APPEARS") == "1" and os.path.exists(tag_file):
-        runs.append({"databaseId": 4242, "displayTitle": "Weekly full CI (" + open(tag_file).read() + ")"})
-    print(json.dumps(runs))
+        runs.append({"databaseId": 4242, "displayTitle": title % open(tag_file).read()})
+    print(json.dumps([{field: run[field] for field in fields} for run in runs]))
     sys.exit(0)
 if args[:2] == ["run", "watch"]:
-    sys.exit(0)
+    exits = [int(code) for code in os.environ.get("FAKE_WATCH_EXITS", "").split(",") if code]
+    call = bump("watch-calls")
+    code = exits[call - 1] if call <= len(exits) else 0
+    if code == 0 and args[2] == "4242":
+        with open(state_file, "w") as out:
+            out.write("completed")
+    sys.exit(code)
 if args[:2] == ["run", "view"]:
-    print(os.environ["FAKE_CONCLUSION"])
+    if args[2:] != ["4242", "--json", "status,conclusion", "--jq", '.status + " " + .conclusion']:
+        sys.exit(2)
+    if os.path.exists(state_file):
+        print("completed " + os.environ["FAKE_CONCLUSION"])
+    else:
+        print("in_progress ")
     sys.exit(0)
 sys.exit(2)
 """
@@ -647,19 +691,28 @@ def _run_weekly_step(tmp_path: Path, **fake: str) -> tuple[subprocess.CompletedP
         "GITHUB_SERVER_URL": "https://github.com",
         "GITHUB_REPOSITORY": "owner/repo",
         "GITHUB_STEP_SUMMARY": str(summary),
-        "FIND_TIMEOUT_SECONDS": "3",
+        # Generous deadlines: a passing case returns as soon as it is done, and
+        # a loaded test runner must not turn a slow loop into a failure.
+        "FIND_TIMEOUT_SECONDS": "30",
+        "WAIT_TIMEOUT_SECONDS": "30",
         "POLL_SECONDS": "0",
         "WATCH_SECONDS": "1",
         "FAKE_GH_LOG": str(log),
+        "FAKE_GH_DIR": str(tmp_path),
         "FAKE_GH_TAG": str(tmp_path / "tag"),
-        "FAKE_GH_LIST_CALLS": str(tmp_path / "list-calls"),
+        "FAKE_GH_STATE": str(tmp_path / "state"),
+        "FAKE_TITLE_FORMAT": _dispatched_title_format(),
         **fake,
     }
     proc = subprocess.run(
-        ["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60, check=False
+        ["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=120, check=False
     )
     calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     return proc, calls, summary.read_text() if summary.exists() else ""
+
+
+def _watched_ids(calls: list[list[str]]) -> set[str]:
+    return {call[2] for call in calls if call[:2] in (["run", "watch"], ["run", "view"])}
 
 
 def test_the_weekly_run_passes_only_when_the_run_it_dispatched_succeeded(tmp_path: Path) -> None:
@@ -668,25 +721,51 @@ def test_the_weekly_run_passes_only_when_the_run_it_dispatched_succeeded(tmp_pat
     proc, calls, summary = _run_weekly_step(tmp_path, FAKE_RUN_APPEARS="1", FAKE_CONCLUSION="success")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert calls[0] == ["workflow", "run", "ci.yml", "--ref", "dev", "-f", "run_tag=weekly-9-1"]
-    watched = [call for call in calls if call[:2] in (["run", "watch"], ["run", "view"])]
-    assert watched and all(call[2] == "4242" for call in watched)
+    assert _watched_ids(calls) == {"4242"}
     assert "success" in summary
 
 
 @pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out", ""])
 def test_the_weekly_run_fails_unless_the_run_it_dispatched_succeeded(tmp_path: Path, conclusion: str) -> None:
-    """A failed, cancelled or unfinished run, or one whose result cannot be
+    """A failed or cancelled run, or a completed run whose result cannot be
     read, turns the weekly run red; only `success` passes."""
     proc, _, _ = _run_weekly_step(tmp_path, FAKE_RUN_APPEARS="1", FAKE_CONCLUSION=conclusion)
     assert proc.returncode != 0
+    assert f"ended {conclusion or 'with no readable result'}" in proc.stdout
+
+
+def test_the_weekly_run_keeps_waiting_when_a_watch_ends_early(tmp_path: Path) -> None:
+    """`gh run watch` exits on any failed API call while the run is still
+    going; the scheduler checks the run's status and watches again instead
+    of reporting a failure that has not happened."""
+    proc, calls, _ = _run_weekly_step(tmp_path, FAKE_RUN_APPEARS="1", FAKE_CONCLUSION="success", FAKE_WATCH_EXITS="1,1")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert sum(call[:2] == ["run", "watch"] for call in calls) == 3
+
+
+def test_the_weekly_run_says_so_when_its_run_is_still_going_at_the_deadline(tmp_path: Path) -> None:
+    """A run that never completes inside the wait is not reported as failed:
+    the message says it was still running, and the weekly run still fails."""
+    proc, _, _ = _run_weekly_step(
+        tmp_path,
+        FAKE_RUN_APPEARS="1",
+        FAKE_CONCLUSION="success",
+        FAKE_WATCH_EXITS=",".join(["1"] * 50),
+        WAIT_TIMEOUT_SECONDS="2",
+    )
+    assert proc.returncode != 0
+    assert "still running" in proc.stdout
 
 
 def test_the_weekly_run_fails_when_its_run_never_appears(tmp_path: Path) -> None:
     """If the dispatched run cannot be found, nothing was proven: fail rather
     than watch the decoy or pass."""
-    proc, calls, _ = _run_weekly_step(tmp_path, FAKE_RUN_APPEARS="0", FAKE_CONCLUSION="success")
+    proc, calls, _ = _run_weekly_step(
+        tmp_path, FAKE_RUN_APPEARS="0", FAKE_CONCLUSION="success", FIND_TIMEOUT_SECONDS="3"
+    )
     assert proc.returncode != 0
-    assert not [call for call in calls if call[:2] in (["run", "watch"], ["run", "view"])]
+    assert "never appeared" in proc.stdout
+    assert not _watched_ids(calls)
 
 
 def test_the_weekly_run_rides_out_a_failing_run_listing(tmp_path: Path) -> None:
