@@ -39,6 +39,16 @@ REQUIREMENTS_DIAGNOSE = REPO_ROOT / "requirements-diagnose.txt"
 SECURITY_MD = REPO_ROOT / "docs" / "security.md"
 UV_LOCK = REPO_ROOT / "uv.lock"
 README = REPO_ROOT / "README.md"
+DEPENDABOT_CONFIG = REPO_ROOT / ".github" / "dependabot.yml"
+
+# (ecosystem, directory, the file Dependabot reads in that directory)
+DEPENDABOT_MANIFESTS = frozenset(
+    {
+        ("uv", "/", "uv.lock"),
+        ("npm", "/examples/refactor_demo/fixture_repo_ts", "package-lock.json"),
+        ("github-actions", "/", ".github/workflows"),
+    }
+)
 
 # The command recorded in requirements-diagnose.txt's own header.
 REGENERATE_DIAGNOSE = (
@@ -256,6 +266,32 @@ def test_requirements_diagnose_excludes_self() -> None:
         "requirements-diagnose.txt must not include the project itself "
         "(generated with --no-emit-project)"
     )
+
+
+# ---------------------------------------------------------------------------
+# .github/dependabot.yml
+# ---------------------------------------------------------------------------
+
+
+def _dependabot_updates() -> list[dict]:
+    return yaml.safe_load(DEPENDABOT_CONFIG.read_text())["updates"]
+
+
+def test_dependabot_watches_each_manifest() -> None:
+    """A manifest that moves leaves Dependabot watching a directory with
+    nothing in it, which it reports as nothing to update."""
+    watched = {(u["package-ecosystem"], u["directory"]) for u in _dependabot_updates()}
+    assert watched == {(eco, directory) for eco, directory, _ in DEPENDABOT_MANIFESTS}
+    for _eco, directory, manifest in DEPENDABOT_MANIFESTS:
+        path = REPO_ROOT / directory.lstrip("/") / manifest
+        assert path.exists(), f"dependabot.yml watches {directory}, which has no {manifest}"
+
+
+def test_dependabot_never_rewrites_pyproject_bounds() -> None:
+    """The bounds in pyproject.toml are what users of this library may
+    install. Python updates move the pins in uv.lock only."""
+    (uv_update,) = [u for u in _dependabot_updates() if u["package-ecosystem"] == "uv"]
+    assert uv_update.get("versioning-strategy") == "lockfile-only"
 
 
 # ---------------------------------------------------------------------------

@@ -1599,6 +1599,10 @@ Alpha — APIs may change before `v1.0`.
   without the `websockets` it needs. The file is regenerated from `uv.lock`, and
   the test suite now fails any change after which the file pins a version or
   hash `uv.lock` does not record, or lists a different set of packages.
+- **Dependabot is configured.** `.github/dependabot.yml` checks the Python lock,
+  the TypeScript demo fixture and the GitHub Actions pins weekly. Python
+  updates move pins in `uv.lock` only and never raise the lower bounds in
+  `pyproject.toml`.
 
 ## [0.14.1] - 2026-09-05
 
