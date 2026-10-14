@@ -205,8 +205,14 @@ def test_unlocked_dependencies_accepts_a_complete_lock(gate) -> None:
 
 @pytest.mark.parametrize(
     "text",
-    ["not = [valid toml", "version = 1\n", _lock(("x", "not a version"))],
-    ids=["broken toml", "no packages", "unreadable version"],
+    [
+        "not = [valid toml",
+        "version = 1\n",
+        _lock(("x", "not a version")),
+        _lock(("x\nstate=success", "1.0")).replace("x\nstate", "x\\nstate"),
+        _lock(("x", "1.0"), extra='\n[[package]]\nname = "q"\nversion = "1.0"\ndependencies = [{ name = "s t" }]\n'),
+    ],
+    ids=["broken toml", "no packages", "unreadable version", "line break in a name", "space in a dependency name"],
 )
 def test_an_unreadable_lock_cannot_tell(gate, text) -> None:
     with pytest.raises(gate.CannotTell):

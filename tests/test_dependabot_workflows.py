@@ -115,6 +115,7 @@ def test_only_the_record_job_writes_and_it_runs_no_action() -> None:
     assert all("uses" not in step for step in record["steps"])
     assert "env" not in judge and "env" not in record
     assert _step(gate, "record", RECORD_STEP)["env"] == {
+        "JUDGE_RESULT": "${{ needs.judge.result }}",
         "GH_TOKEN": "${{ github.token }}",
         "GH_REPO": "${{ github.repository }}",
         "HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
@@ -395,13 +396,26 @@ def test_the_judge_sees_a_rename_into_an_allowed_file(tmp_path: Path) -> None:
     assert outputs == {"state": "success", "description": "waits for a person: changes tools/payload.txt"}
 
 
-def _record(tmp_path: Path, state: str, description: str) -> tuple[subprocess.CompletedProcess[str], list]:
+def test_the_judge_writes_a_reason_with_a_line_break_as_one_line(tmp_path: Path) -> None:
+    """A file name may carry a line break; written as is, the rest of the name
+    would become an output line of its own, here a state that overrides the
+    judge's."""
+    repo, merge_base = _gate_repo(tmp_path)
+    head = _branch(repo, merge_base, {"uv.lock": UP_LOCK, "x\nstate=failure": "payload\n"})
+    proc, outputs = _judge(repo, merge_base, head)
+    assert proc.returncode == 0, proc.stderr
+    assert outputs == {"state": "success", "description": "waits for a person: changes x state=failure"}
+
+
+def _record(
+    tmp_path: Path, state: str, description: str, judge_result: str = "success"
+) -> tuple[subprocess.CompletedProcess[str], list]:
     _write_fake_gh(tmp_path / "bin")
     work = tmp_path / "work"
     work.mkdir()
     step = _step(_load(GATE_WORKFLOW), "record", RECORD_STEP)
     env = {"HEAD_SHA": SHA_C, "STATE": state, "DESCRIPTION": description, "RUN_URL": "https://example.invalid/run/1"}
-    return _run_step(step, work, env)
+    return _run_step(step, work, {**env, "JUDGE_RESULT": judge_result})
 
 
 def _status(state: str, description: str) -> list[str]:
@@ -430,6 +444,15 @@ def test_the_record_step_writes_the_judges_verdict_to_this_prs_head(tmp_path: Pa
 def test_the_record_step_records_a_failure_when_the_judge_did_not_decide(tmp_path: Path, state: str) -> None:
     """A judge that died, was cancelled or wrote garbage never becomes a pass."""
     proc, calls = _record(tmp_path, state, "qualifies")
+    assert proc.returncode == 0, proc.stderr
+    assert calls == [_status("failure", "the gate could not run; see the run")]
+
+
+@pytest.mark.parametrize("judge_result", ["failure", "cancelled", "skipped", ""])
+def test_the_record_step_never_passes_a_judge_job_that_did_not_succeed(tmp_path: Path, judge_result: str) -> None:
+    """A "success" that reached the record job from a red judge is forged or
+    garbled; only a judge that succeeded may pass a head."""
+    proc, calls = _record(tmp_path, "success", "qualifies", judge_result)
     assert proc.returncode == 0, proc.stderr
     assert calls == [_status("failure", "the gate could not run; see the run")]
 

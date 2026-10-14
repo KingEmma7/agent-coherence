@@ -49,6 +49,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 import tomllib
@@ -65,6 +66,9 @@ ALLOWED_FILES = {
 }
 ALLOWED_UPDATE_TYPES = frozenset({"version-update:semver-patch", "version-update:semver-minor"})
 PYPI = {"registry": "https://pypi.org/simple"}
+# A package name as uv.lock writes it. Names reach the verdict text, so one
+# carrying a line break or anything else unexpected is not trusted.
+PACKAGE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 class CannotTell(Exception):
@@ -115,6 +119,10 @@ def lock_packages(lock_text: str) -> list[dict[str, Any]]:
         raise CannotTell(f"unreadable uv.lock: {error}") from error
     if not isinstance(packages, list):
         raise CannotTell("unreadable uv.lock: package is not a list")
+    names = [package.get("name") for package in packages]
+    names += [dependency.get("name") for package in packages for dependency in _dependencies(package)]
+    if not all(isinstance(name, str) and PACKAGE_NAME.fullmatch(name) for name in names):
+        raise CannotTell("unreadable uv.lock: a package name is not a plain name")
     return packages
 
 

@@ -87,6 +87,10 @@ jobs:
           verdict=0
           reason=$(python3 "$gate" --base "$merge_base" --head "$HEAD_SHA" \
             --ecosystem "$ECOSYSTEM" --update-type "$UPDATE_TYPE" --group "$GROUP") || verdict=$?
+          # One line: a line break in the reason could add lines of its own
+          # to GITHUB_OUTPUT, a state among them.
+          reason=${reason//$'\n'/ }
+          reason=${reason//$'\r'/ }
           echo "$reason" | tee -a "$GITHUB_STEP_SUMMARY"
           case "$verdict" in
             0 | 10) state=success ;;
@@ -113,9 +117,11 @@ jobs:
     permissions:
       statuses: write
     steps:
-      # A judge that died before deciding records a failure, never a pass.
+      # A judge that died before deciding records a failure, never a pass, and
+      # a success counts only when the judge job itself succeeded.
       - name: Record the verdict on the PR's head
         env:
+          JUDGE_RESULT: ${{ needs.judge.result }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -129,5 +135,9 @@ jobs:
               STATE=failure
               DESCRIPTION="the gate could not run; see the run" ;;
           esac
+          if [ "$STATE" = success ] && [ "$JUDGE_RESULT" != success ]; then
+            STATE=failure
+            DESCRIPTION="the gate could not run; see the run"
+          fi
           gh api "repos/$GH_REPO/statuses/$HEAD_SHA" -f state="$STATE" -f context=dependabot-gate \
             -f description="${DESCRIPTION:0:140}" -f target_url="$RUN_URL" > /dev/null
