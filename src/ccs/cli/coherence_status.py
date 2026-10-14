@@ -93,9 +93,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Disclosure tier (default: the coordinator's default tier, which "
             "is minimal). 'minimal' redacts absolute paths, session names "
             "and user-added tracked patterns, and still reports per-session "
-            "artifact state (the process id is reported at every tier); "
-            "'metrics' returns counters only; 'full' is the operator view, "
-            "requested with the Coherence-Local-Operator opt-in header."
+            "artifact state; 'metrics' returns counters only, with no paths, "
+            "process id or session identifiers; 'full' is the operator view, "
+            "requested with the Coherence-Local-Operator opt-in header. The "
+            "Python coordinator reports its process id in the minimal and "
+            "full views."
         ),
     )
     # KTD-J (Unit 8): post-install smoke. Drives a two-session stale-read

@@ -416,6 +416,14 @@ class FileMemberSource(Protocol):
     May raise :class:`StructuralMemberRefused` (or a subclass) to declare THIS
     MEMBER undrivable through this surface: capture propagates it as a hard
     typed refusal, restore absorbs it into that member's ``target_lost``.
+
+    Known gap (#239): every pair ``CoherentVolume.read_with_version`` returns
+    moves that volume's foreign-edit baseline to the bytes read. When the
+    source is the volume an agent writes through, an out-of-band edit the
+    versioner reads (capture, or a restore leg that ends ``conflict`` or
+    ``target_lost``) survives the restore but not the agent's next
+    ``write()`` of the path, which lands over it with no ``StaleView``. A
+    split pair the volume refuses replaces no existing baseline.
     """
 
     def read_with_version(self, path: str) -> tuple[bytes, int]:

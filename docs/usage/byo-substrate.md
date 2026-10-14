@@ -172,13 +172,17 @@ for the full posture):
 |---|---|---|
 | `StaleView` | a peer committed since your read; your cached view is stale | `reacquire()` for fresh bytes, recompute, retry |
 | `CasVersionConflict` | the CAS was refused — read `.reason` for which of the four: `version_mismatch` (you lost the version race), `other_holder` (a peer holds the grant and the version has **not** moved), `stale_read_generation` (the claim your read was taken under was reclaimed), `caller_in_transient_state` (a peer invalidated you between read and CAS) | `version_mismatch` — re-read at the current version, recompute, retry. `other_holder` — back off and retry; a re-read returns the same bytes, so recomputing changes nothing. `stale_read_generation` — `reacquire()`, then re-read. `caller_in_transient_state` — recover with a fresh identity |
-| `CommitUnconfirmed` | the write may or may not have landed (a driver/coordinator blip) | **do not blind-retry** — re-read; the binding's reconciliation decides whether it already landed |
-| `ViewWedged` | the substrate moved out of band of the coordinator (e.g. a foreign edit, or a writer that died between its two commit legs) | `reacquire()` and re-decide |
+| `CommitUnconfirmed` | the write may or may not have landed (a driver/coordinator blip) | **do not blind-retry** — re-read. The re-read succeeds if the coordinator recorded the write, or if the write never landed; compare the bytes with yours to tell which. If the substrate holds your bytes but the coordinator never recorded them, the re-read raises `ViewWedged` (next row) |
+| `ViewWedged` | the substrate moved out of band of the coordinator: a foreign edit, a writer that died between its two commit legs, or a commit whose substrate write landed but whose version bump the coordinator never recorded | stop and report it. No binding call clears this yet ([#240](https://github.com/Cohexa-ai/agent-coherence/issues/240)): every agent's `read()` of the artifact raises `ViewWedged`, a coordinator restart does not clear it, and `reacquire()` returns the current bytes but the next `read()` or `commit()` raises `ViewWedged` again. No commit through the binding lands on stale bytes meanwhile |
 
-The one rule that matters: **never blind-retry an unconfirmed write.** The binding
-reconciles by re-reading and comparing the stored version and content fingerprint
-against what you intended — so a write that *did* land is recognized as yours (no
-double-apply), and one that didn't is retried cleanly.
+The one rule that matters: **never blind-retry an unconfirmed write.** When the
+substrate write itself goes unconfirmed, `commit()` reconciles before it returns,
+by re-reading and comparing the stored version and content fingerprint against
+what you intended — so a write that *did* land is recognized as yours (no
+double-apply), and one that didn't is retried cleanly. Nothing reconciles the
+coordinator's half: once the substrate write has landed, a version bump the
+coordinator never recorded leaves the artifact wedged, as the `ViewWedged` row
+says.
 
 ---
 
@@ -193,10 +197,15 @@ points:
   without this layer. Do not run the S3 loop through a Multi-Region Access Point
   or a cross-Region replica, and do not place agents on two hosts against one
   distributed substrate.
-- **A crash between the two commit legs is unbounded in v1.** If a writer's
-  substrate write lands but its process dies before the coordinator bump, peers
-  are not invalidated until their *next* read of that artifact. Repair-forward is
-  on the roadmap.
+- **A substrate write the coordinator never recorded wedges the artifact.** If a
+  writer's substrate write lands but the coordinator never records its version
+  bump (the process dies between the two commit legs, or the bump request is
+  lost or refused), every agent's next `read()` of that artifact raises
+  `ViewWedged`, and so does every `read()` or `commit()` after `reacquire()`,
+  across coordinator restarts. A foreign write to the substrate does the same.
+  It fails closed: no commit through the binding lands on stale bytes, and the
+  substrate keeps the writer's bytes. Repair is tracked in
+  [#240](https://github.com/Cohexa-ai/agent-coherence/issues/240).
 - **More backends are demand-gated.** A Letta vendor-memory sidecar is a post-v1
   candidate, not shipped: Letta exposes no atomic conditional-write token, so a
   binding could only *detect* a sequential stale write (via a client-held content
