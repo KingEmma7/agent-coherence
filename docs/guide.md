@@ -19,37 +19,38 @@ full command-line toolset, and the API reference.
 ## Contents
 
 1. [Installation](#installation)
-2. [Quick start](#quick-start)
-3. [Namespace convention](#namespace-convention)
-4. [Strategies](#strategies)
-5. [Observability](#observability)
-6. [State transitions log](#state-transitions-log)
-7. [Content audit log](#content-audit-log)
-8. [Crash recovery](#crash-recovery)
-9. [Version retention and read-at-version](#version-retention-and-read-at-version)
-10. [Coherent workspace (`CoherentVolume`)](#coherent-workspace-coherentvolume)
-11. [BYO substrate bindings (`CoherentRow`, `CoherentObject`)](#byo-substrate-bindings-coherentrow-coherentobject)
-12. [Workspace versioning & restore (`WorkspaceVersioner`)](#workspace-versioning--restore-workspaceversioner)
-13. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
-14. [Effect fence over HTTP](#effect-fence-over-http)
-15. [Caller principal](#caller-principal)
-16. [Targeted grant handoff](#targeted-grant-handoff)
-17. [Acquire-or-fail on `pre-edit` (specified, not yet built)](#acquire-or-fail-on-pre-edit-specified-not-yet-built)
-18. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
-19. [Inline benchmark mode](#inline-benchmark-mode)
-20. [Telemetry](#telemetry)
-21. [Graceful degradation](#graceful-degradation)
-22. [Examples](#examples)
-23. [Real-workload benchmarks](#real-workload-benchmarks)
-24. [Benchmarking your own workload](#benchmarking-your-own-workload)
-25. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-26. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
-27. [Replay (v0.8.2+)](#replay-v082)
-28. [Command-line tools](#command-line-tools)
-29. [API reference](#api-reference)
-30. [Low-level adapter API](#low-level-adapter-api)
-31. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-32. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+2. [Upgrading from 0.14.1](#upgrading-from-0141)
+3. [Quick start](#quick-start)
+4. [Namespace convention](#namespace-convention)
+5. [Strategies](#strategies)
+6. [Observability](#observability)
+7. [State transitions log](#state-transitions-log)
+8. [Content audit log](#content-audit-log)
+9. [Crash recovery](#crash-recovery)
+10. [Version retention and read-at-version](#version-retention-and-read-at-version)
+11. [Coherent workspace (`CoherentVolume`)](#coherent-workspace-coherentvolume)
+12. [BYO substrate bindings (`CoherentRow`, `CoherentObject`)](#byo-substrate-bindings-coherentrow-coherentobject)
+13. [Workspace versioning & restore (`WorkspaceVersioner`)](#workspace-versioning--restore-workspaceversioner)
+14. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
+15. [Effect fence over HTTP](#effect-fence-over-http)
+16. [Caller principal](#caller-principal)
+17. [Targeted grant handoff](#targeted-grant-handoff)
+18. [Acquire-or-fail on `pre-edit` (specified, not yet built)](#acquire-or-fail-on-pre-edit-specified-not-yet-built)
+19. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+20. [Inline benchmark mode](#inline-benchmark-mode)
+21. [Telemetry](#telemetry)
+22. [Graceful degradation](#graceful-degradation)
+23. [Examples](#examples)
+24. [Real-workload benchmarks](#real-workload-benchmarks)
+25. [Benchmarking your own workload](#benchmarking-your-own-workload)
+26. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+27. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
+28. [Replay (v0.8.2+)](#replay-v082)
+29. [Command-line tools](#command-line-tools)
+30. [API reference](#api-reference)
+31. [Low-level adapter API](#low-level-adapter-api)
+32. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+33. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -91,6 +92,194 @@ pip install "agent-coherence[all]"
 ```
 
 For security-sensitive installs with full transitive hash pinning, see [the security guide](security.md#hash-pinned-install-for-security-sensitive-users) and the bundled `requirements-diagnose.txt`.
+
+---
+
+## Upgrading from 0.14.1
+
+Upgrade every part of a workspace's setup together: the coordinator, every
+client that talks to it (the Claude Code hook client, the console scripts, and
+`CoherentVolume` with the MCP server built on it), and the Claude Code plugin.
+Mixed releases lose protection or stop working:
+
+- a 0.15.0 MCP server, or a 0.15.0 `CoherentVolume` that declares managed
+  globs, will not attach to a 0.14.1 coordinator, because it cannot confirm
+  there that those globs are enforced: the MCP server and a strict volume
+  fail closed, and a degrade-mode volume runs detached, with coherence
+  enforcement off (see [Coherent workspace](#coherent-workspace-coherentvolume));
+- clients from both releases cannot share a session: once the 0.15.0 client
+  claims a [caller principal](#caller-principal) for it, a 0.15.0
+  coordinator refuses the 0.14.1 client's writes and releases in that
+  session's name (below);
+- a plugin 0.5.0 hook client still works against a 0.15.0 coordinator, but it
+  never claims a principal, so its sessions get no principal checks. Once a
+  0.15.0 client, such as a [handoff command](#handoff-commands), claims one for
+  its session, the coordinator refuses that hook client's edits, commits and
+  releases with `400`, and the hook client lets each edit go ahead
+  uncoordinated, as it does on any error.
+
+Pair 0.15.0 with Claude Code plugin 0.6.0 or later. From 0.6.0 the plugin's own
+`agent-coherence-status`, `agent-coherence-track` and `agent-coherence-untrack`
+behave like the Python console scripts in three ways: untrack exits `3` when
+the coordinator refuses it for a strict path, status exits `2` on a
+[degraded answer](#when-the-registry-is-busy), and track and untrack escape
+the text they print from the coordinator. Plugin releases through 0.5.0 do
+none of these: their untrack exits `2` on that refusal, their status exits `0`
+on a degraded answer, and their track and untrack print the coordinator's text
+as sent.
+
+### Back up `.coherence/` first
+
+This release moves the workspace store from registry schema 7, which 0.14.1
+writes, to schema 10. A 0.15.0 coordinator migrates `.coherence/state.db` the
+first time it opens it, and `agent-coherence-workspace` migrates its own
+`.coherence/workspace.db` the same way. There is no step back down: 0.14.1
+refuses a store at schema 10 with `SchemaVersionError: unexpected schema
+version 10 …` and leaves the file as it is. From then on the only ways back
+are to upgrade again, or to restore a copy taken before the upgrade and lose
+everything the coordinator recorded since.
+
+On a workspace the Claude Code plugin's Node coordinator serves, `state.db` is
+that coordinator's own store, which a Python coordinator refuses to open
+rather than migrate, so only `workspace.db` moves. There, skip step 2 below:
+the Node coordinator never opens `workspace.db`, and it answers
+`--prepare-for-migration` with `404`.
+
+To take that copy:
+
+1. Stop every Claude Code session, `CoherentVolume` process and MCP server that
+   uses the workspace.
+2. Stop the coordinator: `agent-coherence-coordinator --prepare-for-migration`
+   releases every write grant it holds and shuts it down, and does nothing when
+   no coordinator is running. Do this before upgrading even if you skip the
+   copy: a 0.14.1 coordinator left running keeps serving the upgraded clients
+   until it exits.
+3. Copy the directory with its permissions, for example
+   `cp -Rp .coherence /path/to/backup/coherence-0.14.1`. The copy holds
+   `state.db`, and `workspace.db` if you used `agent-coherence-workspace`, with
+   any `-wal` and `-shm` files beside them, and the coordinator's secret, so
+   keep it as private as the original (see
+   [security.md](security.md#local-config-and-data-files)).
+4. Upgrade the package and the plugin. The next client that needs a
+   coordinator starts a 0.15.0 one, which migrates the store.
+
+To go back, stop the coordinator the same way, put the copy in place of
+`.coherence/`, and reinstall 0.14.1 and the plugin release you ran with it.
+A 0.15.0 coordinator reports the schema of the store it serves as
+`registry_schema_version` in every `/status` view (see
+[Status, track and untrack commands](#status-track-and-untrack-commands)).
+
+### What changes for a 0.14.1 user
+
+**Coordinator answers**
+
+- **`GET /status`.** `agent_name` is `null` below the operator view, and the
+  default view reports the workspace root as `"."` in `policy_summary` as well
+  as at the top level. Identify sessions by `agent_id`, which every session row
+  still carries, or ask for the operator view. `agent-coherence-status` with no
+  `--detail` now asks for the default view; pass `--detail full` for session
+  names, the absolute root and the pattern lists. `--show-policy` now needs
+  `--detail full` too. See
+  [What each `/status` view carries](#what-each-status-view-carries).
+- **A busy registry.** A `200` answer from `/status` can carry
+  `"tracked_artifacts": null` and `"sessions": null` with `"degraded": true`.
+  A `null` list means the coordinator cannot tell, never that nothing is
+  tracked. Check for `degraded` before reading the lists, and back off before
+  asking again.
+- **Caller principals.** Once a session has claimed a principal, a request
+  naming that session without the right `Coherence-Caller-Principal` header
+  gets HTTP `400` on `pre-edit`, `session-stop`, `post-edit`, `post-edit-cas`,
+  `effect-fence` and the `/workspace/checkpoint` and `/workspace/restore/*`
+  routes. Every 0.15.0 client claims one for its session automatically. A
+  client you wrote yourself keeps working unchanged until something claims its
+  session; to take part, follow
+  [Writing your own HTTP client](#writing-your-own-http-client).
+- **`session-stop`.** A stop that leaves a grant held answers `ok: false` with
+  `released_artifacts` and a `grants` list, where it used to answer `ok: true`.
+  Keep your record of every grant the answer does not report released (see
+  [Release answers, per grant](#release-answers-per-grant)). A malformed
+  `agent_id` gets HTTP `400` instead of an empty success.
+- **Agent ids, not session ids, in hook answers.** The `notices[]` entries that
+  `session-stop` returns rename `preempter_session_id` and
+  `preempter_session_short` to `preempter_agent_id` and
+  `preempter_agent_short`, with no alias. `last_writer_session_id`, on
+  stale-read answers and strict denies, keeps its name but now carries the last
+  writer's agent id. Both ids are 32 hex characters without hyphens; `/status`
+  writes the same id with hyphens.
+- **Strict mode after a refused read.** Strict `pre-edit` now denies a session
+  holding `SHARED` whose last observed version is older than the current one,
+  which is the state a strict Bash or Grep deny leaves behind. Re-run the Bash
+  command, or `Read` the file, before editing it; after a Grep deny only a
+  `Read` lifts it.
+- **Warn mode can deny an edit.** A Claude Code session that has
+  [handed a path off](#targeted-grant-handoff) is denied every edit of it in
+  warn mode as well as in strict mode, for as long as
+  [the giver's fence](#the-givers-fence) holds.
+- **Untracking a strict path.** `POST /policy/untrack` answers HTTP `409` with
+  `reason: "untrack_strict_path"`, and writes nothing, when an entry covers a
+  path the coordinator holds in strict mode. The refusal is deliberate; see
+  [Status, track and untrack commands](#status-track-and-untrack-commands).
+- **Checkpoint restore.** `POST /workspace/restore/register` refuses a
+  write-set naming paths the checkpoint does not describe, a fingerprint other
+  than the captured one, a controller that is not the checkpoint's receiver,
+  and a second controller, each with a typed `reason` and nothing changed.
+  When the receiver or an earlier registration excludes it,
+  `WorkspaceVersioner.restore` raises `CheckpointRegistrationRefused` before it
+  writes anything, and `agent-coherence-workspace restore` exits `2`. A
+  controller that claimed a checkpoint and stopped leaves it registrable by no
+  one else: resume with the same controller, or take a new checkpoint. See
+  [Who may restore a checkpoint](#who-may-restore-a-checkpoint-and-what-its-registration-accepts).
+- **The effect fence.** The hold vocabulary has an eighth reason,
+  `content_claim_absent`. Only the coordinator's fence over HTTP,
+  `POST /hooks/effect-fence`, new in this release, gives it; `gate()` and
+  `swg_gate` cannot. It holds an effect against an artifact whose content the
+  coordinator has never recorded, a case no surface held before: re-read the
+  artifact through a coordinated read and ask again. Code that matches the
+  reasons one by one must accept the new one, and should treat any reason it
+  does not recognise as a hold. See
+  [Hold reasons](#hold-reasons--the-published-vocabulary).
+
+**Python API**
+
+- `CoherentVolume.write_cas()` and `write_cas_at()` return a `CasCommitResult`
+  (`path`, `version`, `handoff`) instead of `None`. Code that ignores the
+  return value is unaffected.
+- `CasVersionConflict.reason` is the coordinator's reason for the refusal:
+  `version_mismatch`, `other_holder`, `stale_read_generation` or
+  `caller_in_transient_state`. It used to be `version_mismatch` every time.
+  Each needs its own recovery: on `other_holder` the version has not moved, so
+  wait for the holder rather than re-reading. The class attribute still reads
+  `version_mismatch`.
+- A strict `CoherentVolume` read raises `CoherenceError` when the coordinator
+  answers its pre-read with an error, and a degrade-mode one warns and sets
+  `is_degraded`; in 0.14.1 the read returned its bytes without registering
+  them. The substrate bindings (`CoherentRow`, `CoherentObject`) treat that
+  answer as unconfirmed too: a read raises, and a commit whose version bump
+  gets it after the substrate write landed raises `CommitUnconfirmed` instead
+  of `CasVersionConflict`. Re-read to reconcile before you retry.
+- `CoherentVolume.session_id` stays the same for the volume's lifetime. Each
+  attempt's identity is `vol.incarnation` (and `vol.agent_id`), so compare
+  those, not `session_id`, to tell one attempt from the next. A `session-stop`
+  naming only the volume's `session_id` now releases nothing; the volume
+  releases its own grants. This needs a coordinator from 0.13.0, or the Claude
+  Code plugin's from 0.3.0.
+- `RedirectRefused.location` is always the placeholder `(withheld)`, never the
+  redirect's target, and the message carries the same placeholder.
+- `gate()` refuses a volume that does not declare both of `CoherentVolume`'s
+  grant-state flags (`_last_read_denied` and `_last_read_stale`), raising
+  `InvariantViolationError`, a `CoherenceError`. Only a hand-rolled stand-in for
+  `CoherentVolume` is affected.
+- A registry you implement against `RegistryBase`
+  (`ccs.coordinator.registry_protocol`) has methods to add, among them
+  `claim_checkpoint_registration`, which returns the pair
+  `(holder, newly_claimed)`.
+
+**Published for the first time**
+
+The request shapes of the four `/handoff/*` routes are new in this release, and
+[an open issue](https://github.com/Cohexa-ai/agent-coherence/issues/286)
+proposes changing them. The untrack refusal's `409` is published as a
+deliberate answer, not an error to be fixed.
 
 ---
 
@@ -1014,7 +1203,12 @@ attempt holds its grants under its own `agent_id`. The coordinator
 takes the file back once the holder has recorded no heartbeat for
 `grant_heartbeat_timeout_sec` (600 s by default; only its reads, writes and
 commits of tracked files record one), or has held it for
-`grant_max_hold_sec` (1800 s by default). The operator view of `/status` then
+`grant_max_hold_sec` (1800 s by default). The sweep cannot tell an idle volume
+from a crashed one: if a volume writes a file and then reads or writes no
+tracked file for longer than the heartbeat timeout, the coordinator takes the
+file back, and the volume's next `write()` of that file raises `StaleView`,
+though nothing else touched it. Recover with `reacquire()`, and write from the
+bytes it returns. The operator view of `/status` then
 lists the file under that holder's `reclaimed` map (see [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)).
 Both are `LifecycleConfig` fields, passed as `config` to the volume that starts
 the coordinator. A Claude Code session releases what it holds when its turn ends.
@@ -1130,7 +1324,10 @@ through the *same* shared workspace root. To make per-worktree sessions coordina
 point every volume at one common root (for example the primary checkout). The Claude
 Code plugin does this for you: it resolves the parent repo via
 `git rev-parse --git-common-dir` so sessions in sibling worktrees share one
-coordinator (`src/ccs/adapters/claude_code/resolver.py`).
+coordinator (`src/ccs/adapters/claude_code/resolver.py`). With one common root
+above the worktrees, the Python coordinator's
+[foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)
+does not watch the files inside them yet ([#241](https://github.com/Cohexa-ai/agent-coherence/issues/241)).
 
 ### When you don't need this
 
@@ -1148,7 +1345,12 @@ back channel your framework doesn't already serialize. You can skip it when:
 
 The liveness tradeoff runs the other way: a crashed holder does not deadlock the
 fleet. A stalled `MODIFIED`/`EXCLUSIVE` grant is bounded and auto-reclaimed by the
-best-effort crash-recovery sweep (per artifact, never a global lock), and the
+best-effort crash-recovery sweep (per artifact, never a global lock). The sweep
+reads only heartbeats and hold time, and only requests on tracked files record a
+heartbeat, so a live volume that goes quiet for `grant_heartbeat_timeout_sec`
+(600 s by default) is reclaimed like a crashed one: its next `write()` of the
+file is refused until it calls `reacquire()` (see
+[Concurrent writers](#concurrent-writers-write_cas)). The
 `write_cas` / `atomic_publish` CAS paths hold no lock at all — a loser just re-reads
 and retries.
 
@@ -1234,9 +1436,9 @@ A declarative manifest binds each artifact to a substrate + connection + tier, a
 ### Honest scope
 
 - **The read-generation fence over a substrate is a roadmap item, not shipped.** v1 OCC writers ride the fence's admit-on-absent path + the version-CAS. Nothing in these bindings claims the fence.
-- **`native-CAS`, with the timeout asterisk.** The substrate CAS prevents the concurrent single-host lost update on the token axis; a coordinator-timeout *after* a durable substrate write is reconverged by a token-identity re-read, and registry↔substrate agreement is a *detectable signal*, not a held guarantee.
+- **`native-CAS`, with the timeout asterisk.** The substrate CAS prevents the concurrent single-host lost update on the token axis; an unconfirmed substrate write is reconverged inside `commit()` by a token-identity re-read, but a coordinator timeout *after* a durable substrate write is not, and registry↔substrate agreement is a *detectable signal*, not a held guarantee (see the coordinator-behind bullet below).
 - **Single-host, subtractive.** When the substrate is itself distributed (S3, managed Postgres), the no-lost-update guarantee is the *substrate's* and is identical with or without this layer; the adapter's contribution (invalidation, uniformity) is single-host. Never run the S3 CAS loop through a Multi-Region Access Point / cross-Region replica, and never place agents on two hosts against one distributed substrate.
-- **Coordinator-behind-substrate is unbounded in v1.** If a writer's substrate write lands but its process dies before the coordinator bump, peers are not invalidated until the *next* binding-mediated read of that artifact — a peer acting on an already-cached read is unprotected until it re-reads. Repair-forward is a roadmap item.
+- **Coordinator-behind-substrate wedges the artifact.** If a writer's substrate write lands but the coordinator never records its version bump (the process dies between the two legs, or the bump is lost or refused), or a foreign write moves the substrate, every agent's next binding-mediated read of that artifact raises `ViewWedged`, and so does every read or commit after `reacquire()`, across coordinator restarts. It fails closed — no commit through the binding lands on stale bytes — but no binding call clears it yet ([#240](https://github.com/Cohexa-ai/agent-coherence/issues/240)).
 - **More backends are demand-gated, not shipped.** A Letta vendor-memory sidecar is a post-v1 candidate: Letta exposes no atomic conditional-write token, so a binding could only *detect* a sequential stale write via a client-held content shadow, not prevent a concurrent one — it would be a `detect-only` tier and lands only when a concrete need pulls it in.
 
 ### Try it, then harden
@@ -1280,10 +1482,12 @@ for member in report.members:
 |---|---|
 | `restored` | the captured bytes landed via the member's conditional write — over whatever was live at that moment, including content committed after the capture; the report below says, per member, what that write discarded |
 | `converged` | the live state already matched the manifest — nothing written |
-| `conflict` | a live foreign writer won; the re-drive budget is bounded, and **the foreign writer's state survives** |
+| `conflict` | a live foreign writer won; the re-drive budget is bounded, and **the foreign writer's state survives the restore** (but see the note below on a `CoherentVolume` member) |
 | `target_lost` | the captured version is no longer reachable (expired retention, a vanished S3 version), or the member itself can no longer be driven safely (its path became a symlink, a hardlink with an outside co-owner, or a non-regular file) — reported, never substituted |
 | `forward_only_skipped` | a declared action surface (or an uncapturable member) — enumerated, skipped |
 | `held_unconfirmed` | a write whose outcome could not be confirmed — held, never guessed |
+
+**A `CoherentVolume` as a file member.** If you pass the `CoherentVolume` an agent writes through to `add_file_member`, every read the versioner gets back through it counts as that volume's last read of the file, and the volume's [write guard](#foreign-edit-guards) checks for out-of-band edits only since its last read or write. So an out-of-band edit the versioner reads at `checkpoint()`, or in a restore leg that ends `conflict` or `target_lost`, survives the restore but not the agent's next `write()` of the file, which lands over it with no `StaleView` ([#239](https://github.com/Cohexa-ai/agent-coherence/issues/239)). A read the coordinator refuses does not count, so this needs it to admit the read: for example, when the agent itself committed the file less than 5 seconds earlier. The `agent-coherence-workspace` command reads members without a volume and is not affected.
 
 **What a restore does not promise.** A restore is not a merge, and nothing on this path refuses a write: a member whose content moved after the capture is put back over, and that later content is gone. What the run gives you is the record of it. Every leg already reads the live state to build its conditional write's comparand, and each member now carries that read as an **observation** in one of five states:
 
@@ -1403,7 +1607,7 @@ Over HTTP, against a running coordinator (the same one `CoherentVolume` spawns):
 | `POST /session/begin` | `{session_id, read_set: ["plans/plan.md", …]}` | `{session_token, cut: {path: version}, coordinator_epoch, retain_versions}` |
 | `POST /session/read` | `{session_id, session_token, path}` | the artifact at its **pinned** version — never a newer one |
 | `POST /session/commit` | `{session_id, session_token, path, content}` | wins only if no peer moved the artifact since the cut was pinned |
-| `POST /session/heartbeat` | `{session_id, session_token}` | keeps the session's lease alive |
+| `POST /session/heartbeat` | `{session_id, session_token}` | keeps the snapshot session's lease alive; it does not keep a write grant alive (see [which requests do](#reading-when-the-sweep-will-reclaim-a-grant)) |
 
 Every session call carries both identifiers: `session_id` (your client identity,
 from which the server derives the caller) and the server-minted `session_token`
@@ -1737,6 +1941,14 @@ one bound to the named session. Branch on `reason`, not on the text. It is never
 a hold, and a refused request changes nothing, so it is safe to send again once
 the client has the right principal.
 
+The policy routes, `POST /policy/track` and `POST /policy/untrack`, name no
+session and check no principal. One of their answers is a deliberate refusal
+of a different kind: an untrack whose entry covers a path the coordinator
+holds in strict mode gets HTTP `409` with `reason: "untrack_strict_path"`
+and a `refused` list, and the same request is refused the same way while the
+coordinator runs. See
+[Status, track and untrack commands](#status-track-and-untrack-commands).
+
 `GET /status` reports two counters at every tier: `caller_principal_absent_total`,
 the requests this coordinator process admitted without a principal (a nonzero
 value means some client is not sending one yet), and
@@ -2012,7 +2224,7 @@ the other grants of the same request still transfer:
 | `handoff_to_self` | the successor is the caller's own session |
 | `handoff_successor_unknown` | the coordinator does not know the successor id. Every grant of the request gets it |
 | `handoff_successor_malformed` | the successor is not a well-formed agent id. Every grant of the request gets it |
-| `handoff_ended` | a re-send of a handoff that ended at an unmoved version: declined, withdrawn or superseded. The entry adds `giver`, `successor`, `version_at_transfer`, `hold_shape` and `status` |
+| `handoff_ended` | a re-send of a handoff that ended at an unmoved version: declined, withdrawn or superseded. The entry adds `giver`, `successor`, `version_at_transfer`, `hold_shape` and `status`. A request carries no version, so a new handoff from the same giver to the same successor after a decline or withdraw is refused this way too, even when the giver has read the path again, until the path's version moves or the ended record is [evicted](#ended-records-and-eviction). Nothing is recorded |
 
 Match on the whole value; the reasons may grow, and none is ever renamed.
 
@@ -2938,7 +3150,8 @@ too. A grant ends when its holder releases it — `session-stop`, which a Claude
 Code session sends at the end of its turn, or a failed `post-edit` — or hands it
 on with a [transfer](#targeted-grant-handoff), or when the
 coordinator reclaims it from a silent holder (no heartbeat for
-`grant_heartbeat_timeout_sec`, or held longer than `grant_max_hold_sec`). Poll
+`grant_heartbeat_timeout_sec`, or held longer than `grant_max_hold_sec`; see
+[which requests record a heartbeat](#reading-when-the-sweep-will-reclaim-a-grant)). Poll
 with backoff rather than wait for a signal.
 
 **Under load.** A timed-out opted-in request must not answer in a shape that
@@ -3516,6 +3729,25 @@ plainly:**
   whose files reach git's index. Files you deliberately keep out of git are
   outside the instrument by design and need no fixing; where you do want them
   watched, the tracked set has to name files git tracks.
+- **A linked worktree or a subdirectory root is not watched yet.** The detector
+  runs git in the coordinator's root and matches what git reports against the
+  coordinator's own names for its files, which are relative to that root. In two
+  layouts nothing matches, and a foreign write is never counted
+  ([#241](https://github.com/Cohexa-ai/agent-coherence/issues/241)). The first is
+  a linked worktree whose coordinator is rooted at the main checkout, which is
+  where `agent-coherence-coordinator` and `agent-coherence-hook-client` root it
+  when started inside a worktree with no `--root`, so that sibling worktrees
+  share one coordinator: git in the main checkout does not report the
+  worktree's files at all. The second is a root below the top of its repository
+  (`--root` naming a subdirectory, a `CoherentVolume` rooted in one, or the MCP
+  server started in one with no `SWG_ROOT`): git names each file from the
+  repository top, not from that root. With no other file in scope, the run is
+  listed in `report.uncoverable` with the reason `no-git-visible-artifact`,
+  although git does track these files. With other files in scope, the run
+  watches those alone, and nothing in the report shows these files were missed.
+  Under a subdirectory root that holds a directory of its own name, such as
+  `repo/sub/sub/`, a write to one file can be checked against another and read
+  as no foreign write.
 - **A suppression expires.** A mismatch excused as a write still landing is
   re-examined once the window passes. If no write ever landed, it becomes a
   foreign write and is counted as one. The benefit of the doubt is temporary.
@@ -3743,13 +3975,32 @@ inside it.
 | `0` | Done. For `agent-coherence-status` this includes no coordinator running, which it reports on standard error. A path the command rejects itself, next to paths it sends, is reported and does not change the code. |
 | `1` | Not in a git repository; for `track` and `untrack`, also every path rejected by the command's own validation. Nothing is sent. |
 | `2` | `track` or `untrack` could not reach the coordinator; the connection failed TLS verification or configuration; or the coordinator redirected the request (never followed), answered an HTTP error, or answered a body that is not a JSON object or whose fields have the wrong types. `agent-coherence-status` also exits `2` on a [degraded answer](#when-the-registry-is-busy). |
-| `3` | `agent-coherence-status --self-test` failed, or `agent-coherence-untrack` was refused because a path is enforced in strict mode and untracked nothing. A refusal that does not name each refused path with the strict patterns covering it exits `2` instead, as the HTTP error it is, with the coordinator's error text. |
+| `3` | `agent-coherence-status --self-test` failed, or `agent-coherence-untrack` was refused because a path is enforced in strict mode (HTTP `409`, `reason: "untrack_strict_path"`) and untracked nothing. A refusal that does not name each refused path with the strict patterns covering it exits `2` instead, as the HTTP error it is, with the coordinator's error text. |
 
 An exit `2` prints one line on standard error, starting with the command's
 name, never a traceback; the one exception is `agent-coherence-status --json`
 on an answer without its two lists, such as a degraded one, which prints the
 body instead. An HTTP error reads `HTTP <code>: <error>`, with the
 coordinator's `error` text, or `HTTP <code>` when it sent none.
+
+**What the policy routes answer.** The track and untrack commands send
+`POST /policy/track` and `POST /policy/untrack` with `{"paths": [...]}`, at
+most 20 paths a request. Neither route names a session, so neither checks a
+[caller principal](#caller-principal).
+
+| Answer | When |
+|---|---|
+| `200` `{"ok": true, "added": [...], "rejected": [...]}` from track, `{"ok": true, "removed": [...], "rejected": [...]}` from untrack | the request was taken. Each path the coordinator would not take is in `rejected` as `{"path", "reason"}` |
+| `400` `{"error": "..."}` | a malformed request (`paths` is not a list of strings, or holds more than 20), or a policy file that cannot take a new entry (see **Policy files** below) or would grow past 64 KiB. Nothing is written |
+| `409` `{"ok": false, "error": "...", "reason": "untrack_strict_path", "refused": [...], "rejected": [...]}` | untrack only: an entry, a path or a glob, covers a path the coordinator holds in strict mode. Each `refused` entry is `{"path", "strict_patterns"}`. Nothing is written, for any path in the request |
+
+The `409` is a deliberate refusal, not a failure. A strict path stays enforced
+for as long as the coordinator runs, so the same request is refused the same
+way until then; branch on `reason`, not on the text. To untrack the path,
+remove its entry from `.coherence/strict_mode.yaml` and restart the
+coordinator. `agent-coherence-untrack` exits `3` on it, and so does the Claude
+Code plugin's own `agent-coherence-untrack` from plugin 0.6.0. The plugin's
+Node coordinator has no such refusal.
 
 **Policy files.** `track` and `untrack` add each path to
 `.coherence/tracked.yaml` or `.coherence/ignored.yaml` as a double-quoted YAML
@@ -3791,7 +4042,13 @@ way.
 These are the Python console scripts' rules. Where the Claude Code plugin's own
 `agent-coherence-status`, `agent-coherence-track` or `agent-coherence-untrack`
 comes first on the Bash tool's `PATH`, that program runs instead, with its own
-output and exit codes.
+output and exit codes. From plugin 0.6.0 those programs exit `3` when untrack
+is refused for a strict path and `2` on a degraded `/status` answer, as these
+do, and their track and untrack escape what the coordinator sends before
+printing it. Their `agent-coherence-status` prints the `/status` body as JSON,
+which escapes an escape character or a newline but not a right-to-left
+override. Plugin releases through 0.5.0 exit `2` and `0` in those two cases,
+and their track and untrack print the coordinator's text as sent.
 
 **Which store format a coordinator writes.** Every `/status` view from the
 Python coordinator, `?detail=metrics` and a
@@ -3815,6 +4072,78 @@ the coordinator is unreachable, which `coordinator` `unknown` shows, or when the
 coordinator's answer carries no such field. The MCP server does not attach to
 the Node coordinator or to a release up to v0.14.1 at all, because it cannot
 confirm their managed globs.
+
+### What each `/status` view carries
+
+`GET /status` answers one of three views, picked with `?detail=`. Every view
+needs the workspace's bearer secret, and every body names its view in
+`detail`. A `detail` value other than these three gets the default view. This
+is the Python coordinator's answer; the Claude Code plugin's Node coordinator
+serves the default and `metrics` views in a shape of its own and answers
+`detail=full` with `501`.
+
+| View | Ask with | Carries |
+|---|---|---|
+| `metrics` | `?detail=metrics` | counters only |
+| `minimal`, the default | no `detail`, or `?detail=minimal` | the tracked paths and who holds them, without session names or absolute paths |
+| `full`, the operator view | `?detail=full` with the `Coherence-Local-Operator: true` header; without the header the answer is `403` | session names, the absolute root, the pattern lists and the grant detail |
+
+**`metrics`** carries `coordinator_version`, `coordinator_backend`,
+`coordinator_uptime_seconds`, `registry_schema_version` and the counters:
+`endpoint_counters`, request counts by route, and the rest, such as
+`watchdog_timeouts_total`, `sweep_reclaims_total` and
+`caller_principal_absent_total`. It names no path, no process id and no
+session. It does not read the registry, so it is never degraded.
+
+**`minimal`**, the default, carries everything in `metrics`, and:
+
+- `tracked_artifacts`: one entry per path the coordinator has a record for,
+  with the `path` relative to the workspace root, its `version` and its
+  artifact `id`, and a [`handoff` key](#the-handoff-key) while the path has a
+  transfer record. Untracking a path does not remove its entry;
+- `sessions`: one row per agent that this coordinator process has seen or
+  that holds a path, with its `agent_id`, its `states` (each path it holds, as
+  `SHARED`, `EXCLUSIVE` or `MODIFIED`), and `agent_name` set to `null`. An
+  agent id is derived one way from the session id, which no row at this view
+  shows;
+- `policy_summary`: the five pattern counts (`default_pattern_count`,
+  `user_added_pattern_count`, `ignored_pattern_count`,
+  `strict_mode_pattern_count`, `rejected_pattern_count`) and `coordinator_root`
+  as `"."`;
+- `coordinator_root`, also `"."`;
+- `coordinator_pid`, the coordinator's process id.
+
+**`full`**, the operator view, carries everything in the default view, with
+these differences:
+
+- `coordinator_root` and `policy_summary.coordinator_root` are the absolute
+  workspace root;
+- each `sessions[]` row's `agent_name` is the session's name, which contains
+  the raw session id, or `null` when this coordinator process has no name on
+  record for it, as for a grant held from before a restart;
+- `policy_summary` adds the four pattern lists: `tracked_patterns`,
+  `user_added_patterns`, `ignored_patterns` and `strict_mode_patterns`;
+- each `tracked_artifacts` entry adds `last_writer_agent_id` and
+  `last_writer_at_unix_ts` (the agent that last committed the path, and when;
+  both `null` until a commit) and `owner_generation`, and its `handoff` key
+  adds `created_at_unix_ts`;
+- each `sessions[]` row adds `reclaimed`, `grants` and
+  `last_heartbeat_unix_ts`, and an agent listed only for a reclaim gets a row
+  too, for 24 hours after its newest reclaim (see
+  [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)
+  and
+  [Reading when the sweep will reclaim a grant](#reading-when-the-sweep-will-reclaim-a-grant));
+- the body adds `grant_heartbeat_timeout_sec` and `grant_max_hold_sec`.
+
+**A degraded answer.** When the default or operator view cannot take the
+registry lock in time, it still answers `200`, with every other key of that
+view, with `tracked_artifacts` and `sessions` set to `null`, and with
+`"degraded": true`, a key a normal answer never carries. A `null` list means
+"cannot tell", never "nothing tracked". See
+[When the registry is busy](#when-the-registry-is-busy).
+
+`agent-coherence-status --detail LEVEL` asks for each view by name; with no
+`--detail` it asks for the default view and sends no operator header.
 
 ### `ccs-simulate` and `ccs-compare`
 

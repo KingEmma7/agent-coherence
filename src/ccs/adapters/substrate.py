@@ -291,8 +291,10 @@ class CoherenceSubstrate(Protocol):
 # the coordinator first would advance the version and invalidate peers for a
 # write that can still lose the substrate compare-and-set — a phantom
 # invalidation, indistinguishable from a real advance and therefore
-# unrecoverable. Substrate-first is self-healing: if the coordinator leg is lost,
-# the next read reconciles because the token moved.
+# unrecoverable. Substrate-first fails closed instead, but it does not heal: if the
+# coordinator leg is lost, nothing reconciles it yet. Every agent's next read is
+# denied as coordinator-behind (ViewWedged), across coordinator restarts, and
+# reacquire() does not clear it (#240). No commit lands on stale bytes meanwhile.
 
 
 # ---------------------------------------------------------------------------
@@ -886,7 +888,11 @@ class CoordinatedSubstrate:
     def reacquire(self, artifact_ref: str) -> tuple[bytes, "SubstrateToken"]:
         """Shed a sticky deny: mint a fresh identity, then re-read under it
         (SHARED@current). The caller MUST rebuild any pending write from these
-        fresh bytes."""
+        fresh bytes.
+
+        It does not clear a coordinator-behind wedge (#240): the bytes come
+        back, but the next :meth:`read` or :meth:`commit` raises
+        :class:`~ccs.core.exceptions.ViewWedged` again."""
         self._coordinator.reacquire()
         observed_bytes, token = self._substrate.read(artifact_ref)
         content_hash = _sha256_hex(observed_bytes)
@@ -942,9 +948,11 @@ class CoordinatedSubstrate:
                 )
             return
         # Coordinator-behind: the substrate token moved but the coordinator did
-        # not — a foreign out-of-band write, or a writer crash between the two
-        # commit legs. Unbounded in v1 (a peer on an already-cached read is
-        # unprotected until its next binding-mediated read); recover via reacquire.
+        # not — a foreign out-of-band write, a writer crash between the two
+        # commit legs, or a bump the coordinator never recorded. No call here
+        # clears it yet (#240): reacquire()'s re-read takes the same deny, so the
+        # next read() or commit() lands here again, for every agent and across
+        # coordinator restarts.
         raise ViewWedged(
             f"the substrate for {artifact_ref!r} moved out of band of the coordinator "
             "(coordinator-behind); reacquire() and re-decide"

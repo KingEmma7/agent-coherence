@@ -243,8 +243,15 @@ reclaim are in the operator view only too: each tracked artifact's
 (`grant_heartbeat_timeout_sec`, `grant_max_hold_sec`). The default `minimal`
 view reports `agent_name` as `null`, the workspace root as `.` (both
 `coordinator_root` and `policy_summary.coordinator_root`) and the pattern
-counts without the patterns, and the `metrics` view carries no sessions at
-all. A tracked artifact that has a handoff record
+counts without the patterns. It still lists each tracked path relative to the
+root, each session's agent id with the states it holds, and the Python
+coordinator's process id (`coordinator_pid`), which the operator view carries
+too. The `metrics` view carries counters only: no paths, no process id and no
+sessions. When the Python coordinator's registry is busy, its default and
+operator views answer with their usual keys, `"degraded": true` and `null`
+path and session lists (see [When the registry is busy](guide.md#when-the-registry-is-busy)),
+so a degraded answer discloses nothing its view does not. A tracked artifact that
+has a handoff record
 carries a `handoff` key in the default and operator views, naming the giver,
 the successor and any session that overtook the handoff by session-level agent
 id — the agent id derived from the session id alone, so for a `CoherentVolume`
