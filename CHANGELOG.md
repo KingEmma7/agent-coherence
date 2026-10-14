@@ -4,7 +4,11 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
-## [Unreleased]
+## [0.15.0] - 2026-10-14
+
+**Sessions can hand a held path to a named successor, a caller principal keeps protocol-following clients from acting as each other's sessions, and the effect fence answers over HTTP; `/status` reports sweep reclaims, grant ages, each artifact's last writer and the store's schema version; and a run of fixes closes ways a stale read, a refused read or a policy edit let a write overwrite newer work.**
+
+**Upgrade note:** upgrade the coordinator, its clients (`CoherentVolume`, the MCP server, the hook client and the console scripts) and the Claude Code plugin together, and pair this release with plugin 0.6.0 or later. Once a 0.15.0 client has claimed a caller principal for a session, an older client naming that session is refused with HTTP `400` on the routes that can change another writer's work; a plugin 0.5.0 hook client still works but claims no principal, so its sessions get no principal protection. The registry moves to schema 10 on first open, the workspace CLI's `workspace.db` included, and the step is forward-only: 0.14.1 refuses a store this release has opened, and the only way back is to move `state.db` aside, which loses its retained content, fence state, principals, handoff records and checkpoint claims. The breaking changes are listed in the guide's [Upgrading from 0.14.1](docs/guide.md#upgrading-from-0141) section.
 
 ### Added
 
@@ -347,9 +351,14 @@ Alpha — APIs may change before `v1.0`.
   this, writer identity was only reachable by tripping a stale read or opening
   `.coherence/state.db`. The fields come from the existing batched
   `status_snapshot` query (now selecting `last_writer_id` and `updated_at`),
-  so `/status` stays two SELECTs. The minimal and metrics tiers are unchanged:
-  writer attribution is workspace-state disclosure, and whether any of it
-  belongs at the default tier is left to #198.
+  so `/status` stays two SELECTs. The writer is the session the committing
+  request named. Unless that session has claimed a caller principal, the
+  coordinator checks the name only for its shape, so the field attributes a
+  commit without authenticating it; even for a session that has claimed one,
+  `/session/commit` and `/session/commit_all` admit a request that presents
+  no principal. The default and metrics tiers do not carry the fields:
+  writer attribution is workspace-state disclosure, and it stays at the
+  operator tier.
 
 - **The effect fence now answers over HTTP: `POST /hooks/effect-fence`.**
   "May this irreversible effect still fire, and if not, why?" was reachable
@@ -599,7 +608,8 @@ Alpha — APIs may change before `v1.0`.
   `--detail full`. `--show-policy` lists the user-added patterns, which only
   the operator view carries, so below it every pattern read as observed and the
   list said "none"; it now needs `--detail full` and otherwise exits 2 with a
-  usage error that says so. The process id is still reported at every tier.
+  usage error that says so. The process id is still reported at the default and
+  `full` tiers, and the `metrics` tier still carries none.
 
 - **A Claude Code giver's edit no longer lands (#185).** As the giver's fence
   was first built, its `pre-edit` answer carried the typed `handed_off` reason
@@ -1345,23 +1355,47 @@ Alpha — APIs may change before `v1.0`.
   read still records what it found, even when refused, so a write that follows
   it is still checked. `write_cas_at` / `swg_write_cas` discards the bytes its
   own read returns, so a CAS that loses no longer counts the peer's bytes as
-  seen: after reading a file and then losing a CAS on it, a `write()` /
-  `swg_write` of the older content is denied instead of overwriting the peer's
-  commit, including while that commit is still reaching disk. On a file the
-  volume never read, that read still records what it found, even when the CAS
-  loses or the read fails, so an edit made outside the coordinator afterwards
-  is still caught. A refusal
+  seen: after reading a file and then losing a CAS on it with
+  `CasVersionConflict`, a `write()` / `swg_write` of the older content is
+  denied instead of overwriting the peer's commit, including while that commit
+  is still reaching disk. That protection does not survive a CAS that ends in
+  `ViewWedged` instead (`view_wedged` from `swg_write_cas`), which happens when
+  its read lands while a peer's commit is still reaching disk, or a
+  multi-member `atomic_publish` that raises `CasVersionConflict`: a `write()` /
+  `swg_write` made before the peer's bytes land is then admitted, the
+  coordinator records it as the newest version, and the peer's bytes overwrite
+  it on disk (#248). On a file the volume never read, the CAS's own read still
+  records what it found, even when the CAS loses or the read fails, so an edit
+  made outside the coordinator afterwards is still caught. A refusal
   caused by a peer's commit still reaching disk clears on its own, so retry
   `reacquire()` and the read for a few seconds first. When the refusal outlasts
   that (an out-of-band edit, or a commit whose disk write failed), the
   coordinator has never recorded the bytes on disk and re-reading will not clear
   it: `write()` the bytes `reacquire()` returned, or a merge of them, to record
   them. A write made sooner can be overwritten by the peer's commit when it
-  lands. The deny text and the `swg_read` description now say so.
+  lands. The deny text and the `swg_read` description now say so. After an
+  `atomic_publish` raises `PublishMaterializationError`, a versioned read of
+  each `not_landed` file is refused the same way, and its disk still holds
+  the old bytes: `write()` the bytes you published for it, not the bytes
+  `reacquire()` returns. Re-reading each file at its current version, the
+  recovery 0.14.1 documented for that error, now gets this refusal.
   `WorkspaceVersioner` handles the refusal from a `CoherentVolume` file member:
   a checkpoint records that member as an unconfirmed pointer (`forward_only`,
   flagged `dirty_during_window`) instead of raising, and a restore leg re-drives
   and then concludes `conflict` without writing, so the restore still finishes.
+
+  **Behaviour change:** `read_with_version()` and
+  `read_with_version_generation()` can now raise `StaleView` where 0.14.1
+  returned the pair, and `swg_read` can answer `stale_view`, whatever
+  `on_stale_read` says. That option governs only `read()`, which under the
+  default `"allow"` still returns the bytes in the same window. `gate()`
+  meets the refusal at its capture read, so it now raises `StaleView` before
+  `decide` runs, with `hold_cause` and the version and generation fields
+  `None`; 0.14.1 ran `decide` and then held with `read_denied` or
+  `generation_unconfirmed`. A `FileMemberSource` that wraps a
+  `CoherentVolume` must let `StaleView` through: the versioner records the
+  member as above only for that exception, and any other exception from the
+  read propagates out of `checkpoint()`.
 
 - **A refused `read()` no longer lets the next `write()` overwrite an
   out-of-band edit.** With `on_stale_read="raise"`, a read of a file someone
@@ -1605,6 +1639,28 @@ Alpha — APIs may change before `v1.0`.
   instrument by design and need no fixing; where coverage is wanted, the
   tracked set has to name files git tracks.
 
+- **A new workspace's `.coherence/` directory is created at mode `0700`.**
+  A `CoherentVolume` or `SubstrateCoordinatorSession` with managed globs
+  that starts the coordinator writes its strict-mode policy into
+  `.coherence/` first, and it created the directory with the default mode
+  (`0755` under a `022` umask). Starting the coordinator then tightened it to
+  `0700` and logged a WARNING that it had "tightened existing .coherence
+  directory", on every new workspace, about a directory this package had
+  made a moment earlier. Both now create it at `0700`. An existing directory
+  is left as it is, and starting the coordinator still tightens a looser one
+  and warns.
+
+- **The offline conflict report no longer reads zero for a store whose path
+  contains `#` or `?`.** `ccs.diagnose.conflict_counters.read_conflict_totals`
+  opened `state.db` read-only through a SQLite URI built from the path as
+  written, so a `#`, `?` or `%` in the path was read as URI syntax. Under a
+  directory such as `proj#1/`, SQLite opened a different file, `proj`,
+  read-write and creating it if missing, and the reader reported a store
+  that still held its counts as zero recorded conflicts. The path is now
+  percent-encoded, so the reader opens the file it was given, read-only, and
+  `:memory:` raises `FileNotFoundError` instead of reading as an empty
+  store. The new foreign-write report reader opens the store the same way.
+
 ### Security
 
 - **`requirements-diagnose.txt` pins patched dependencies and installs
@@ -1622,6 +1678,123 @@ Alpha — APIs may change before `v1.0`.
   the TypeScript demo fixture and the GitHub Actions pins weekly. Python
   updates move pins in `uv.lock` only and never raise the lower bounds in
   `pyproject.toml`.
+
+### Known limitations
+
+- When all eight of the Python coordinator's handler slots are busy it
+  answers `503`, and both the Python hook client and the Claude Code plugin's
+  hook client turn that answer, a client timeout or a dropped connection into
+  `{}`: a stale warning is lost and, in strict mode, a deny becomes an allow
+  (#223).
+- Eight connections that open and send nothing hold every handler slot of the
+  Python coordinator until they close, because the handler sets no read
+  timeout; until then every request, hook calls included, gets that `503`
+  (#237).
+- A `POST /handoff/transfer` holds a handler slot while it runs, about 0.1 s
+  at its limit of 64 paths, and under heavy hook traffic that is enough to
+  push other sessions' hook calls into the same `503` (#280).
+- When a Claude Code session's caller principal is refused and claiming again
+  cannot fix it (another claimant's nonce, or `.coherence/` files lost while
+  the coordinator keeps the binding), both hook clients answer `{}` and write
+  one line to stderr, so the session's later edits run uncoordinated and the
+  model is not told; start a new session. Python coordinator only (#258).
+- In strict mode a Bash or Grep deny says that retrying the same command will
+  be denied again, but the identical retry is allowed; and a Read or Edit deny
+  tells the model to re-read the file with the Read tool, which stays denied
+  until a Bash or Grep command on the file clears it. Both coordinators
+  (#242).
+- Foreign-write detection misses writes when the coordinator root is not the
+  top of the git work tree that holds the file: in every `claude --worktree`
+  session, whose coordinator is rooted at the parent repository, and under a
+  root below the repository top (`--root` on a subdirectory, or the MCP server
+  started from one). The report then reads `not-coverable` with reason
+  `no-git-visible-artifact`, or `instrumented-zero` when another registered
+  file is visible. Detection never gates a write (#241).
+- A handoff giver's shell write that the hook does not recognise, or could
+  not check in time, is not reported to the successor, and foreign-write
+  detection files one landing within about 10 seconds of the last coordinated
+  commit as `lag_suppressed` rather than `foreign`. A successor that read the
+  file before that write and then writes the whole file from its read loses
+  it; Claude Code's Write tool stops such a successor with its own
+  modified-since-read check (#278).
+- The shell-read check in `pre-bash` does not follow a `cd` inside the
+  command: `cd notes && tail plan.md` counts as a read of `plan.md` at the
+  workspace root, which registers a separate artifact when `**/plan.md` is
+  tracked, so a later transfer of the real file can be refused
+  `handoff_not_held`. Edits through Claude Code's Edit and Write tools are
+  still checked by `pre-edit` (#277).
+- `pre-bash` resolves a relative path from the coordinator root, because the
+  hook request carries no working directory: after a `cd` in an earlier Bash
+  call, and in every `claude --worktree` session, a relative path names the
+  wrong file, and the handoff giver's shell-write refusal misses that write.
+  A write spelled with an absolute path is matched correctly (#282).
+- `release_checkpoint` records a member `released` before it drops the S3
+  legal hold, so a crash between the two steps, or a substrate error other
+  than a missing version or a bucket without Object Lock, leaves the hold on
+  behind a row no later call revisits. On such an error the call raises and
+  logs an `ERROR` line naming the version; `CoherentObject.release_legal_hold`
+  on that binding, by version, clears it (#211).
+- `release_checkpoint` keeps a legal hold only while another checkpoint in the
+  same registry still uses it, so it can drop a hold that another registry
+  sharing the bucket, or someone who placed it by hand, still relies on; use
+  one registry per bucket (#212).
+- An S3 member re-declared through a different binding or key than the one
+  that placed its hold is recorded `released` with a `WARNING`, while the hold
+  stays on; clear it with `CoherentObject.release_legal_hold` on the original
+  binding (#213).
+- When a `WorkspaceVersioner` checkpoint or restore reads an out-of-band edit
+  through an agent's own `CoherentVolume` within 5 seconds of that agent's
+  last write to the file, the agent's next `write()` overwrites the edit
+  without raising `StaleView`, even after a restore that reported `conflict`
+  (#239).
+- With `CoordinatedSubstrate`, a commit whose substrate write lands but whose
+  coordinator bump is never recorded leaves that artifact refusing every
+  agent's `read()` and `commit()` with `ViewWedged`, across coordinator
+  restarts; neither re-reading nor `reacquire()` clears it, and no documented
+  call recovers it yet (#240).
+- While another volume's `write_cas_at` is between its confirmed commit and
+  its disk write, a plain `write()` or `swg_write` from a volume with no
+  current view of the file (one that never read it, read it only during that
+  window, or since ended a CAS on it in `ViewWedged` or a multi-member
+  `atomic_publish` in `CasVersionConflict`) is lost: both calls succeed, the
+  disk ends with the compare-and-swap's bytes, the coordinator records the
+  `write()`, and later compare-and-swaps on the file raise `ViewWedged` until
+  a plain `write()`. It needs a slow disk write, such as a large file or a
+  slow fsync (#248).
+- A `CoherentVolume`'s write grant is kept alive only by its requests on
+  tracked paths, not by `POST /session/heartbeat`, so a volume that writes a
+  file and then makes no such request for longer than the heartbeat timeout
+  (600 s by default) gets `StaleView` on its next `write()` of that file;
+  `reacquire()` recovers (#256).
+- Caller-principal files and `state.db` rows are never reclaimed: each Claude
+  Code session leaves two small files in `.coherence/`, and each claiming
+  session, volume included, one row. Remove a session's files only when no
+  hook of that session can still run; deleting them earlier leaves its later
+  edits uncoordinated (#244).
+- MCP tools answer a transient coordinator error, such as a locked SQLite
+  database, with `reason: internal_error`, `recover: none` and
+  `retryable: false`, so an agent stops where a later call could succeed; a
+  write's outcome is then unknown, so re-read before retrying (#259).
+- The `stale-write-guard-fs` MCP server exits at startup, before its tools
+  appear, when the coordinator it attaches to does not enforce its
+  `SWG_MANAGED` globs (default `**`), for example one a Claude Code session
+  started first; the reason goes only to the server's stderr. Let the server
+  start its own coordinator, or set `SWG_MANAGED` to globs the running Python
+  coordinator enforces. It cannot attach to the plugin's Node coordinator,
+  which does not publish the globs it enforces (#260).
+- On the Claude Code plugin's Node coordinator, untracking a strict path, or
+  ignoring it under a broader pattern, still takes it out of strict mode; the
+  Python coordinator refuses that untrack with HTTP `409` and keeps the path
+  strict (#261, Cohexa-ai/agent-coherence-plugin#177).
+- A handoff request names no record: after a decline or withdraw, handing the
+  same path to the same successor again is refused `handoff_ended` until the
+  path's version moves (or the ended record is evicted, 24 hours later by
+  default), and a late `accept`, `decline` or `withdraw` acts on whichever
+  record is live (#286).
+- Two restores of different checkpoints, run at the same time from different
+  versioners over a shared member, are not ordered against each other: both
+  can report the member `restored` while only the last write is on disk. Run
+  one restore at a time (#176).
 
 ## [0.14.1] - 2026-09-05
 
