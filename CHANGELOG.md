@@ -145,6 +145,13 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **Calling `ccs.cli.diagnose.main()` preserves the process's SIGPIPE handler
+  (#304).** Embedded calls no longer make later writes to closed pipes or
+  sockets terminate the host process, and can run from a worker thread.
+  The `ccs-diagnose` command and `python -m ccs.cli.diagnose` still exit
+  quietly on SIGPIPE. For an existing editable install, rerun
+  `pip install -e .` to regenerate the `ccs-diagnose` launcher.
+
 - **A file changed outside the coordinator no longer goes unnoticed while a
   session holds it (#278).** A change that reaches the disk without a commit
   -- a script, an editor, a shell write the hooks do not recognise, including
