@@ -64,11 +64,12 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol, runtime_checkable
+from typing import Any, Callable, Iterator, Literal, Protocol, TypeVar, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import yaml
@@ -96,6 +97,7 @@ from ccs.coordinator.registry_protocol import (
     RECLAIM_TRIGGERS,
     CheckpointMember,
     TransferRecord,
+    WatchdogAbort,
 )
 from ccs.coordinator.service import (
     CallerPrincipalUncached,
@@ -163,6 +165,8 @@ from ccs.core.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 # Finding #30 — typed interface for the `req` parameter passed to all
@@ -1040,8 +1044,9 @@ class CoordinatorHTTPServer:
         # because the GIL serializes bytecode execution. Under Python
         # 3.13+ free-threaded builds (PEP 703) and on PyPy, that
         # guarantee is gone — concurrent threads can read-modify-write
-        # the same counter and tear increments. These three counters
-        # are operator-facing reliability signals (a missed bump means
+        # the same counter and tear increments. These counters (and the
+        # watchdog late-completion / late-abort pair, #338) are
+        # operator-facing reliability signals (a missed bump means
         # an under-reported degradation event in a bug report), so
         # protect their mutation with a lock. Product-signal counters
         # (intra_task_acquire_release_total, stale_warning_*_total)
@@ -1072,8 +1077,10 @@ class CoordinatorHTTPServer:
         # agent will never post-edit. We can't cancel the future
         # without invasive cancel-token plumbing through service.write,
         # but we CAN detect it: every timed-out future gets a
-        # done_callback that bumps this counter + logs CRITICAL if the
-        # future eventually finished without exception. Operators see
+        # done_callback that bumps this counter if the future eventually
+        # finished without exception, and logs it at the level
+        # :func:`_late_work_may_have_landed_a_guarded_mutation` picks
+        # (#338). Operators see
         # the symptom via ``/status?detail=metrics`` even when the
         # cause is rare (4s deadline + 1.5s busy_timeout = real-world
         # only hits with a wedged SQLite or contended drive).
@@ -1742,8 +1749,12 @@ class CoordinatorHTTPServer:
         agent's knowledge, since the handler had already returned a
         degraded response. Operator-visible via
         ``/status?detail=metrics`` so a phantom-grant cluster is
-        diagnosable from a bug report."""
-        self._watchdog_late_completion_total += 1
+        diagnosable from a bug report. Counts every such completion, whether
+        or not it may have changed state the caller was not told about; the
+        log line says which (#338). REL-03: locked, as it is bumped from
+        concurrent pool threads."""
+        with self._reliability_counter_lock:
+            self._watchdog_late_completion_total += 1
 
     def increment_watchdog_late_abort(self) -> None:
         """A6: a watchdog-timed-out future aborted at the registry write lock
@@ -1753,8 +1764,10 @@ class CoordinatorHTTPServer:
         (#236, ``_AnswerEffects.defer``): no deny was recorded, though registry
         work the body did before deciding may have landed. Operator-visible via
         ``/status?detail=metrics`` so the abort rate is distinguishable from
-        the unmitigated ``watchdog_late_completion_total`` residual."""
-        self._watchdog_late_aborts_total += 1
+        the unmitigated ``watchdog_late_completion_total`` residual. REL-03:
+        locked, as it is bumped from concurrent pool threads."""
+        with self._reliability_counter_lock:
+            self._watchdog_late_aborts_total += 1
 
     def record_401(self) -> None:
         """P1 #6: bump ``auth_401_total`` and (deduped to once per 60s)
@@ -1911,9 +1924,11 @@ class CoordinatorHTTPServer:
 
         Either way we attach a done_callback for the residual: a future that
         slips past the abort window and completes successfully bumps
-        ``watchdog_late_completion_total`` + logs CRITICAL; one that aborts
-        cleanly bumps ``watchdog_late_aborts_total`` so operators can see the
-        mitigation working.
+        ``watchdog_late_completion_total`` and is logged at the level
+        :func:`_late_work_may_have_landed_a_guarded_mutation` picks for
+        ``abort`` (#338); one that aborts cleanly bumps
+        ``watchdog_late_aborts_total`` so operators can see the mitigation
+        working.
         """
         timeout = HANDLER_TIMEOUT_SEC if deadline is None else deadline - time.monotonic()
         if timeout <= 0:
@@ -1924,7 +1939,9 @@ class CoordinatorHTTPServer:
         except FuturesTimeout:
             if abort is not None:
                 abort.set()
-            future.add_done_callback(self._on_watchdog_future_done_after_timeout)
+            future.add_done_callback(
+                lambda done: self._on_watchdog_future_done_after_timeout(done, abort)
+            )
             raise
 
     def run_admission_lookup(self, fn: Callable[[], Any], *, deadline: float) -> Any:
@@ -1942,13 +1959,16 @@ class CoordinatorHTTPServer:
         future = self._watchdog.submit(fn)
         return future.result(timeout=max(0.0, deadline - time.monotonic()))
 
-    def _on_watchdog_future_done_after_timeout(self, future: Any) -> None:
+    def _on_watchdog_future_done_after_timeout(
+        self, future: Any, abort: threading.Event | None
+    ) -> None:
         """Callback wired by :meth:`run_with_watchdog` when its future
         timed out. Fires later (microseconds to many seconds) when the
         underlying work actually completes. We only count + log when
         the late completion produced state — i.e., the future finished
         without raising. A future that ultimately raised was a no-op
-        in the registry; nothing phantom there."""
+        in the registry; nothing phantom there. ``abort`` is the request's
+        token, which decides the log level (#338)."""
         if future.cancelled():
             return
         try:
@@ -1965,16 +1985,45 @@ class CoordinatorHTTPServer:
             # Late failure — no phantom state landed in the registry.
             return
         self.increment_watchdog_late_completion()
+        if not _late_work_may_have_landed_a_guarded_mutation(abort):
+            logger.warning(
+                "watchdog late completion: a handler future timed out and its "
+                "work finished afterwards without winning the registry write "
+                "guard with its request's token, so it left no write grant "
+                "(M/E), commit, release, handoff, checkpoint record or snapshot "
+                "session the caller was not told about (a read grant or a "
+                "consumed notice may still have landed). Counter total now: %d.",
+                self._watchdog_late_completion_total,
+            )
+            return
         logger.critical(
-            "watchdog late completion: a handler future timed out but the "
-            "underlying work completed successfully afterwards. Any state "
-            "it mutated (e.g., an EXCLUSIVE grant) is in the registry "
-            "without the agent's knowledge. Check /status?detail=metrics "
-            "for watchdog_late_completion_total and consider running "
-            "agent-coherence-status --detail=full to inspect orphaned "
-            "M/E grants. Counter total now: %d.",
+            "watchdog late completion: a handler future timed out and its work "
+            "finished afterwards, having won the registry write guard before the "
+            "deadline. A mutation it made under that guard (a write grant, commit, "
+            "release, handoff, checkpoint record, principal bind or snapshot "
+            "session) may be in the registry without the caller's knowledge; a "
+            "refused or conflicting attempt lands nothing. Check "
+            "/status?detail=metrics for watchdog_late_completion_total and run "
+            "agent-coherence-status --detail=full to look for orphaned M/E "
+            "grants; a snapshot session opened this way is not listed there "
+            "(its session_begin event is in .coherence/session-audit.log), and "
+            "the liveness sweep reaps it. Counter total now: %d.",
             self._watchdog_late_completion_total,
         )
+
+
+def _late_work_may_have_landed_a_guarded_mutation(abort: threading.Event | None) -> bool:
+    """Whether a watchdog-abandoned body that completed may have landed a
+    mutation under ``abort_guard`` with its request's ``abort`` (#338). Yes
+    when its :class:`WatchdogAbort` won the guard; no when it never did, or
+    when the body had no token to thread; cannot tell for a plain ``Event``,
+    which records nothing -- answered yes, so the CRITICAL errs toward
+    firing."""
+    if abort is None:
+        return False
+    if isinstance(abort, WatchdogAbort):
+        return abort.guard_won
+    return True
 
 
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -2639,8 +2688,8 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # alongside the stale-read warning. A verify_only read must NOT pop
             # them — the fence discards the body, so a destructive pop here
             # would drop the notice the agent needs on its next real read.
-            notices = coordinator.registry.pop_pending_notices(
-                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+            notices = _pop_notices_for_answer(
+                coordinator, abort, agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
             )
             if notices:
                 notice_text = _build_preemption_text(coordinator, notices)
@@ -2670,8 +2719,8 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             and result.get("status") == "fresh"
             and "hookSpecificOutput" not in result
         ):
-            notices = coordinator.registry.pop_pending_notices(
-                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+            notices = _pop_notices_for_answer(
+                coordinator, abort, agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
             )
             if notices:
                 notice_text = _build_preemption_text(coordinator, notices)
@@ -2702,9 +2751,9 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 
     # A6: pre-read never threaded an abort into its grants — its SHARED
     # re-grants are idempotent, so a late one is harmless. The token serves
-    # the re-grounding delivery, whose pop is NOT idempotent: a zombie that
-    # outlives the degraded response must not claim the flag out from under
-    # the next live admit.
+    # the two pops that are NOT idempotent, the notice drain (#339) and the
+    # re-grounding delivery: a zombie that outlives the degraded response
+    # must not consume what the next live admit delivers.
     effects = _AnswerEffects()
     abort = effects.abort
     _run_or_degrade(
@@ -3331,8 +3380,8 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # Pop any notices for THIS session (the caller of pre-edit) and
         # merge into the response (A1: surface on the victim's next hook
         # of any kind).
-        notices = coordinator.registry.pop_pending_notices(
-            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        notices = _pop_notices_for_answer(
+            coordinator, abort, agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
         )
         notice_text = _build_preemption_text(coordinator, notices) if notices else None
 
@@ -3512,7 +3561,10 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
             # the same preemption prose. The subagent flagged this as a
             # double-emit hazard — the post-edit-failure response IS the
             # surfacing channel for this specific case.
-            popped = coordinator.registry.pop_preemption_notice(agent_id, artifact_id)
+            popped = _consume_for_answer(
+                coordinator, abort,
+                lambda: coordinator.registry.pop_preemption_notice(agent_id, artifact_id),
+            )
             if popped is not None:
                 preempter_id, preempted_at = popped
                 # ADV-004: distinguish sweep reclamation from peer preemption.
@@ -3555,7 +3607,7 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
     # envelope keeps clients reading result.get("ok") safe on timeout.
     # A6: abort threaded into invalidate/commit so a late post-edit aborts at
     # the registry lock instead of landing a phantom version bump/invalidation.
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req, coordinator, work_with_handoff, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort
     )
@@ -3734,7 +3786,7 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     # cross-host follow-on. v1's only obligation: the client must never
     # mistake a degraded CAS for success — hence _OCC_DEGRADED_RESPONSE
     # ({ok: false, …}), never _OK_DEGRADED_RESPONSE.
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req, coordinator, work_with_handoff, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort
     )
@@ -3825,7 +3877,7 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         # stream-json `--include-hook-events`) AND, opportunistically, as
         # `additionalContext` so any post-Stop processing or human-readable
         # log still carries the signal.
-        pending = coordinator.registry.pop_pending_notices(agent_id)
+        pending = _pop_notices_for_answer(coordinator, abort, agent_id)
         notices_payload: list[dict] = []
         for art_id, preempter_id, ts in pending:
             art = coordinator.registry.get_artifact(art_id)
@@ -3871,7 +3923,7 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     # envelope keeps clients reading result.get("ok") safe on timeout.
     # A6: abort threaded into the per-artifact invalidate so a late release
     # aborts before revoking a grant the registry handed to the next session.
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
 
 
@@ -3921,7 +3973,7 @@ def _handle_session_start(
     if subagent_id is not None:
         coordinator.register_session(session_id, subagent_id)
 
-    abort = threading.Event()
+    abort = WatchdogAbort()
 
     def work() -> dict:
         text, workspace_has_state = _build_session_start_context(
@@ -3942,8 +3994,10 @@ def _handle_session_start(
         if text is None:
             return {}
         # Non-empty payload → arm deferred delivery (KTD5). Ordering matters:
-        # the flag is set only AFTER a successful build, so a degraded or
-        # failed request leaves the deferred path unarmed.
+        # the flag is set only AFTER a successful build, so a failed request,
+        # or one that timed out before its build won the registry lock,
+        # leaves the deferred path unarmed. A build already past the lock when
+        # the deadline passes still arms it, and the next admit delivers it.
         coordinator.mark_compact_pending(session_id)
         return {
             "hookSpecificOutput": _payloads.emit_session_start(
@@ -3951,9 +4005,11 @@ def _handle_session_start(
             )
         }
 
-    # A6 pattern: abort threads into the builder's abort_guard so a
-    # watchdog-timed-out request fails closed at the registry lock instead
-    # of arming the flag after the client already saw the degraded `{}`.
+    # A6 pattern: abort threads into the builder's registry guard
+    # (_abort_guard_without_mark, which leaves the token unmarked: the build
+    # only reads) so a request that timed out before its build won the
+    # registry lock fails closed there instead of arming the flag after the
+    # client already saw the degraded `{}`.
     _run_or_degrade(
         req,
         coordinator,
@@ -4252,7 +4308,9 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     First, though, a command that WRITES a path this session handed off
     under a live record (#185) gets the giver's pre-edit deny, byte for byte
     (:func:`_deny_giver_shell_write`); without such a record every answer
-    below is unchanged.
+    below is unchanged. When that check cannot tell -- its lookup timed out --
+    an admit below says so (#341): ``degraded: true`` and the could-not-verify
+    advisory, as context only; a deny goes out as it is.
 
     Request: ``{session_id, command}``.
     Response:
@@ -4290,16 +4348,22 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # #185: ahead of the read detection, which never looks for a write -- a
     # giver denied its Edit would otherwise append through the shell. Answers
     # only when a live record names this session as giver of a path the
-    # command writes; otherwise nothing below changes by a byte.
-    if _deny_giver_shell_write(req, coordinator, session_id=session_id, command=command):
+    # command writes. #341: a lookup that timed out decided nothing, so every
+    # admit below carries the could-not-verify advisory.
+    giver_check = _deny_giver_shell_write(req, coordinator, session_id=session_id, command=command)
+    if giver_check is _GiverShellCheck.ANSWERED:
         return
+    giver_unverified = giver_check is _GiverShellCheck.UNVERIFIED
     # Detect tracked paths the command would read. is_tracked is the
     # policy gate — handler never touches SQLite for an untracked workspace.
     # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-reads
     # exit — see the pre-read twin for the no-flag byte/behavior guarantee.
     tracked_paths = detect_tracked_paths(command, coordinator.policy.is_tracked)
     if not tracked_paths:
-        _fast_path_json(req, coordinator, session_id, body, {"status": "fresh"})
+        base: dict = {"status": "fresh"}
+        if giver_unverified:
+            base = _with_giver_check_unverified(base)
+        _fast_path_json(req, coordinator, session_id, body, base)
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
@@ -4404,8 +4468,8 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "stale_paths": [s["path"] for s in stale_summaries],
             }
 
-        notices = coordinator.registry.pop_pending_notices(
-            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        notices = _pop_notices_for_answer(
+            coordinator, abort, agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
         )
 
         if not stale_summaries and not notices:
@@ -4450,18 +4514,35 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # decision inside work(); notices/stale prose render first. The
         # abort token rides along so a timed-out request never consumes
         # the compact-pending flag.
+        result = work()
+        if giver_unverified:
+            result = _with_giver_check_unverified(result)
         return _deliver_pending_reground(
-            coordinator, session_id, body, work(), abort=abort
+            coordinator, session_id, body, result, abort=abort
         )
 
     # A6: pre-bash never threaded an abort into its grants — its SHARED
     # re-grants are idempotent, and a late one still lands. The token serves
-    # the re-grounding delivery, whose pop is NOT idempotent: a zombie that
-    # outlives the degraded response must not claim the flag out from under
-    # the next live admit.
+    # the two pops that are NOT idempotent, the notice drain (#339) and the
+    # re-grounding delivery: a zombie that outlives the degraded response
+    # must not consume what the next live admit delivers.
     effects = _AnswerEffects()
     abort = effects.abort
     _run_or_degrade(req, coordinator, work_with_reground, effects=effects)
+
+
+class _GiverShellCheck(Enum):
+    """What :func:`_deny_giver_shell_write` did. Three states, not a bool: a
+    lookup that timed out found no record AND did not look, and answering it as
+    "no record" is what let a giver's shell write through unannounced (#341)."""
+
+    #: It wrote the answer: the giver's deny, the 503 or the error envelope.
+    ANSWERED = "answered"
+    #: No written path is tracked, or none is handed off by this session.
+    CLEAR = "clear"
+    #: The lookup timed out: whether the command writes a handed-off path is
+    #: not known.
+    UNVERIFIED = "unverified"
 
 
 def _deny_giver_shell_write(
@@ -4470,9 +4551,9 @@ def _deny_giver_shell_write(
     *,
     session_id: str,
     command: str,
-) -> bool:
+) -> _GiverShellCheck:
     """Answer the giver's deny when ``command`` writes a path this session
-    handed off under a live record (#185); return whether it answered.
+    handed off under a live record (#185); return what it did.
 
     Detection is a pure string scan, so a command that writes no tracked path
     touches no registry (nor does one the detector fails on). Otherwise the
@@ -4481,17 +4562,18 @@ def _deny_giver_shell_write(
     gate's lookup does. A lookup that finishes in time keeps that deadline, so
     the lookup and whatever answers after it share one ``HANDLER_TIMEOUT_SEC``:
     a hit answers the giver's pre-edit deny through the guarded path, and no
-    hit returns False. A lookup that times out is counted like every timeout,
-    puts the deadline back as it found it and returns False, so the caller
-    answers exactly what it answered before this check existed, on the budget
-    it had then. A full watchdog queue answers the 503 and a raising lookup the
-    internal-error envelope -- the gate's two other exits."""
+    hit returns ``CLEAR``. A lookup that times out is counted like every
+    timeout, puts the deadline back as it found it and returns ``UNVERIFIED``:
+    the caller runs the checks after it on the budget they had before this one
+    existed, and its admit says the check did not run (#341). A full watchdog
+    queue answers the 503 and a raising lookup the internal-error envelope --
+    the gate's two other exits."""
     written = _tracked_writes(coordinator, command)
     if not written:
-        return False
+        return _GiverShellCheck.CLEAR
     caller = caller_principal_identity(session_id)
     if _watchdog_queue_overflowed(req, coordinator):
-        return True
+        return _GiverShellCheck.ANSWERED
     prior_deadline = _watchdog_deadline(req)
     try:
         handed = coordinator.run_admission_lookup(
@@ -4504,12 +4586,12 @@ def _deny_giver_shell_write(
         req._watchdog_deadline = prior_deadline
         coordinator.increment_watchdog_timeout()
         logger.warning("pre-bash giver lookup timed out after %ss; answering without it", HANDLER_TIMEOUT_SEC)
-        return False
+        return _GiverShellCheck.UNVERIFIED
     except Exception as exc:
         _answer_handler_error(req, coordinator, exc, failed="pre-bash giver lookup")
-        return True
+        return _GiverShellCheck.ANSWERED
     if handed is None:
-        return False
+        return _GiverShellCheck.CLEAR
     path, record = handed
     effects = _AnswerEffects()
 
@@ -4520,7 +4602,27 @@ def _deny_giver_shell_write(
         )
 
     _run_or_degrade(req, coordinator, work, effects=effects)
-    return True
+    return _GiverShellCheck.ANSWERED
+
+
+def _with_giver_check_unverified(result: dict) -> dict:
+    """``result`` as pre-bash answers it when its giver lookup timed out
+    (#341). An admit says the check did not run: ``degraded: true`` and
+    :data:`DEGRADED_FRESHNESS_ADVISORY`, appended after any stale warning or
+    notice, or as context only on a bare admit. It decides nothing: the check
+    that could have denied a giver's write did not run, so an ``allow`` the
+    read check put on a stale warning is dropped -- in time that write is
+    denied, and an admit that skipped Claude Code's own prompt for it would
+    widen the decision (#337). A deny -- the strict-mode shell-read deny --
+    goes out byte for byte. The admit test is the re-grounding seam's, which
+    attaches after this."""
+    if not _reground_qualifies(result):
+        return result
+    hso = result.get("hookSpecificOutput")
+    if hso is not None:
+        result = {**result, "hookSpecificOutput": {
+            key: value for key, value in hso.items() if key != "permissionDecision"}}
+    return {**_attach_pretooluse_context(result, DEGRADED_FRESHNESS_ADVISORY), "degraded": True}
 
 
 def _tracked_writes(coordinator: CoordinatorHTTPServer, command: str) -> list[str]:
@@ -4694,8 +4796,8 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "stale_paths": [s["path"] for s in stale_summaries],
             }
 
-        notices = coordinator.registry.pop_pending_notices(
-            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        notices = _pop_notices_for_answer(
+            coordinator, abort, agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
         )
 
         if not stale_summaries and not notices:
@@ -4742,9 +4844,9 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 
     # A6: pre-grep never threaded an abort into its grants — its SHARED
     # re-grants are idempotent, and a late one still lands. The token serves
-    # the re-grounding delivery, whose pop is NOT idempotent: a zombie that
-    # outlives the degraded response must not claim the flag out from under
-    # the next live admit.
+    # the two pops that are NOT idempotent, the notice drain (#339) and the
+    # re-grounding delivery: a zombie that outlives the degraded response
+    # must not consume what the next live admit delivers.
     effects = _AnswerEffects()
     abort = effects.abort
     _run_or_degrade(req, coordinator, work_with_reground, effects=effects)
@@ -4834,6 +4936,10 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
       - WIN → ``{ok: true, session_token, cut: {path: version}, coordinator_epoch,
         retain_versions}``
       - typed rejection (unknown id / caps) → ``{ok: false, reason, ...}``
+      - watchdog timeout → ``{ok: true, degraded: true}`` with no token; a
+        late body still waiting for the registry lock stops there before
+        opening a session (#340), and one already past it can still open
+        one, which the liveness sweep reaps
     """
     body = req._read_json()
     if body is None:
@@ -4868,7 +4974,7 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
         # client speaks paths; artifact UUIDs stay server-internal).
         id_to_path = {aid: path for aid, path in zip(read_set_ids, read_set)}
         result = coordinator.service.begin_session(
-            read_set=read_set_ids, owner=owner, created_at_tick=now,
+            read_set=read_set_ids, owner=owner, created_at_tick=now, abort=abort,
         )
         if isinstance(result, VersionedReadRejection):
             # Typed cap / unknown-id rejection — NO session opened, no pins.
@@ -4892,7 +4998,12 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
             "retain_versions": result.retain_versions,
         }
 
-    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
+    # A6 (#340): a begin answered degraded carries no token, so its late body
+    # must not open a session: one still waiting for the registry lock aborts
+    # there. One already past the lock when the deadline passes still opens
+    # its session, and the liveness sweep reaps it.
+    abort = WatchdogAbort()
+    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
 
 
 def _session_read_content_fields(content: bytes | str) -> dict:
@@ -5119,7 +5230,7 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
 
     # Fail-closed degrade: a timed-out session.commit must NOT read as success
     # (mirror the OCC commit endpoint — a degraded commit is a definite reject).
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(req, coordinator, work, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort)
 
 
@@ -5269,7 +5380,7 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
 
     # Fail-closed degrade: a timed-out batch commit must NOT read as success —
     # same posture as /session/commit (a degraded commit is a definite reject).
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(req, coordinator, work, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort)
 
 
@@ -5380,7 +5491,7 @@ def _handle_principal_claim(req: _RequestProtocol, coordinator: CoordinatorHTTPS
             return _typed_reason_response(exc)
         return {"ok": True, "principal": principal}
 
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req, coordinator, work, degraded_response=_PRINCIPAL_CLAIM_DEGRADED_RESPONSE, abort=abort
     )
@@ -5934,7 +6045,7 @@ def _handle_handoff_transfer(req: _RequestProtocol, coordinator: CoordinatorHTTP
                 entries[path] = _transfer_grant_entry(path, outcome)
         return _transfer_answer([entries[path] for path, _ in grants])
 
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req, coordinator, work, degraded_response=_HANDOFF_TRANSFER_DEGRADED_RESPONSE, abort=abort
     )
@@ -5994,7 +6105,7 @@ def _settle_handoff(
             return {"ok": False, "reason": HANDOFF_NOT_LIVE_REASON}
         return _verb_body(settle(artifact_id=artifact_id, caller=caller, abort=abort))
 
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(req, coordinator, work, degraded_response=degraded_response, abort=abort)
 
 
@@ -6300,7 +6411,7 @@ def _handle_workspace_checkpoint(
     # Fail-closed degrade + abort threading (the A6 session-commit lesson):
     # a timed-out registration must NOT read as success, and the abort Event
     # fails the late write closed at the registry lock.
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req, coordinator, work, degraded_response=_CHECKPOINT_DEGRADED_RESPONSE, abort=abort
     )
@@ -6490,7 +6601,7 @@ def _handle_workspace_restore_status(
             "coordinator_epoch": coordinator.registry.coordinator_epoch,
         }
 
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req,
         coordinator,
@@ -6588,7 +6699,7 @@ def _handle_workspace_restore_member(
             "coordinator_epoch": coordinator.registry.coordinator_epoch,
         }
 
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req,
         coordinator,
@@ -6738,7 +6849,7 @@ def _handle_workspace_restore_register(
             body["retry_of_own_registration"] = True
         return body
 
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req,
         coordinator,
@@ -7518,8 +7629,11 @@ _DEFAULT_DEGRADED_RESPONSE: dict = {
     # straight through) instead of an empty allow. ``status`` stays "fresh" for
     # wire back-compat (clients branch on it); the advisory + ``degraded`` flag
     # are the honest signal that freshness is UNVERIFIED, not confirmed.
-    "hookSpecificOutput": _payloads.emit_allow(
-        source="watchdog_degraded_read",
+    # #337: context-only -- no ``permissionDecision``. An ``allow`` would skip
+    # Claude Code's own permission prompt for the Read, Bash or Grep call
+    # exactly when the check did not run, and in time a tracked fresh path is
+    # answered with no decision at all.
+    "hookSpecificOutput": _payloads.emit_pretooluse_context(
         additional_context=DEGRADED_FRESHNESS_ADVISORY,
     ),
 }
@@ -7587,8 +7701,10 @@ empty payload. Re-grounding is advisory (KD3): a watchdog timeout must look
 exactly like "nothing to say", never block, and never claim state it could
 not read. The compact-pending flag is armed INSIDE the timed work only
 after a successful non-empty build (with the A6 abort threaded into the
-builder's ``abort_guard``), so a degraded response also means the deferred
-path stays unarmed."""
+builder's registry guard, :func:`_abort_guard_without_mark`), so a request
+that timed out before its build won the registry lock leaves the deferred
+path unarmed. A build already past the lock when the deadline passes still
+arms it, and the session's next qualifying admit delivers the re-grounding."""
 
 _OCC_DEGRADED_RESPONSE: dict = {
     "ok": False,
@@ -7692,7 +7808,7 @@ class _AnswerEffects:
     deny is the answer sent."""
 
     def __init__(self) -> None:
-        self.abort = threading.Event()
+        self.abort = WatchdogAbort()
         self._queued: list[Callable[[], None]] = []
 
     def defer(self, record: Callable[[], None]) -> None:
@@ -7989,6 +8105,76 @@ def _build_preemption_text(
     return "\n".join(lines)
 
 
+def _consume_for_answer(
+    coordinator: CoordinatorHTTPServer,
+    abort: threading.Event,
+    consume: Callable[[], _T],
+) -> _T | None:
+    """Run ``consume`` -- a pop of the caller's pending preemption notices --
+    for the answer this request is building, or return None without running
+    it when the watchdog already answered the request (#339).
+
+    A notice is delivered once: the pop deletes what it returns. A body that
+    outlived its deadline returns into nothing, so a pop it made would delete
+    notices no caller is ever sent. ``abort`` is checked under the registry
+    lock the pop runs under, so a body abandoned before its pop leaves every
+    notice queued for the session's next hook. The guard does not mark the
+    token: a drain cannot leave a grant behind, so it must not make a late
+    read-only body look like one that may have (#338). The abandoned body is
+    not raised out of either: it may already have landed a grant or a release,
+    which the watchdog must still count as a late completion.
+
+    A deadline that passes after the pop, while the body still renders its
+    answer, still loses what it popped."""
+    try:
+        with _abort_guard_without_mark(coordinator.registry, abort):
+            return consume()
+    except WatchdogAbandoned:
+        return None
+
+
+def _pop_notices_for_answer(
+    coordinator: CoordinatorHTTPServer,
+    abort: threading.Event,
+    agent_id: UUID,
+    *,
+    consume_limit: int | None = None,
+) -> list[tuple[UUID, UUID, float]]:
+    """The caller's pending preemption notices, popped for this answer through
+    :func:`_consume_for_answer`: none when the request was already answered,
+    which leaves them queued for the session's next hook (#339)."""
+    return _consume_for_answer(
+        coordinator, abort,
+        lambda: coordinator.registry.pop_pending_notices(agent_id, consume_limit=consume_limit),
+    ) or []
+
+
+@contextmanager
+def _abort_guard_without_mark(
+    registry: SqliteArtifactRegistry, abort: threading.Event | None
+) -> Iterator[None]:
+    """``registry.abort_guard`` for a pass that reads or only consumes what it
+    returns: the registry lock held across it, failing closed with
+    :class:`WatchdogAbandoned` the instant the lock is won if the request
+    already timed out (A6) -- but without marking ``abort`` as having won the
+    guard, which tells the watchdog the late body may have landed a mutation
+    the caller was not told about (#338). A request already abandoned fails
+    before it waits for the lock: nothing clears an abort, so the wait could
+    only end in the same raise."""
+    _raise_if_abandoned(abort)
+    with registry.abort_guard():
+        _raise_if_abandoned(abort)
+        yield
+
+
+def _raise_if_abandoned(abort: threading.Event | None) -> None:
+    if abort is not None and abort.is_set():
+        raise WatchdogAbandoned(
+            "handler watchdog timed out before this pass ran; "
+            "aborting before it touches the registry (A6)."
+        )
+
+
 def _build_session_start_context(
     coordinator: CoordinatorHTTPServer,
     session_id: str,
@@ -8003,9 +8189,10 @@ def _build_session_start_context(
 
     KTD2: the payload is rebuilt from registry truth on EVERY delivery, from
     ONE consistent read pass — the whole registry walk happens under a single
-    ``abort_guard`` hold (a plain re-entrant lock acquire for the inner read
-    calls), so a peer commit cannot tear the view between the snapshot and
-    the per-row last-observed / last-writer reads. The pass is read-only:
+    registry-lock hold (:func:`_abort_guard_without_mark`; a plain re-entrant
+    lock acquire for the inner read calls), so a peer commit cannot tear the
+    view between the snapshot and the per-row last-observed / last-writer
+    reads. The pass is read-only:
     R6 forbids this endpoint from recording observations, and the pending
     preemption notices are PEEKED, never popped — consumption ownership
     stays with the admit-endpoint drains.
@@ -8028,7 +8215,7 @@ def _build_session_start_context(
     # registry lock so the two locks never nest in names→registry order.
     agents = coordinator.agents_for_session(session_id)
 
-    with coordinator.registry.abort_guard(abort):
+    with _abort_guard_without_mark(coordinator.registry, abort):
         # Scoped to THIS session's agents (SB-10 review): the walk below can
         # only render rows belonging to `agents`, this runs on a hook path
         # twice per compaction, and nothing garbage-collects `agent_states` —
@@ -8264,7 +8451,7 @@ def _fast_path_json(
     payload nobody will read; a zombie that already won the pop forfeits
     the delivery (R2 permits at-most-once → zero)."""
     if coordinator.has_compact_pending(session_id):
-        abort = threading.Event()
+        abort = WatchdogAbort()
 
         def deliver() -> dict:
             return _deliver_pending_reground(
