@@ -22,8 +22,11 @@ Two input types (plan §"Deny reason-flow"):
   auto-memory ``project_cc_strict_mode_retry_hazard``). An unrecognized
   ``CoherenceError`` (a CAS corruption raise, a path escape) fails closed as
   ``internal_error`` — the mapper never lets an exception become a success.
-- **Type B** — synthesized here (NO adapter raise-site) when the volume is
-  unattached / the coordinator transport failed → ``coordinator_unavailable``.
+- **Type B** — synthesized here, with no exception, when the volume is
+  unattached → ``coordinator_unavailable`` with ``retry_later``. The same
+  reason also arrives as Type A: an attached strict volume raises
+  ``CoordinatorUnreachable`` when its coordinator gives no usable answer, and
+  that row stops and reports instead.
 - **Type C** — a handoff tool's typed refusal (#185), a value the volume
   returns rather than raises: mapped by exact reason through
   :data:`HANDOFF_REFUSALS`, each row not retryable and carrying a fixed
@@ -63,6 +66,7 @@ from ccs.core.exceptions import (
     CasVersionConflict,
     CommitPreempted,
     CommitUnconfirmed,
+    CoordinatorUnreachable,
     GiverFenced,
     InternalConcurrencyError,
     StaleView,
@@ -98,6 +102,22 @@ GIVER_FENCED_NEXT_STEP = (
     "successor named here, at the version named here."
 )
 
+# An attached strict volume got no usable answer from its coordinator. The
+# volume keeps the endpoint it attached to and never reaches a coordinator
+# started after this one died, so no call in this server session gets through:
+# the verb is the house stop, not the unattached refusal's ``retry_later``.
+# Like the giver's words, these never name a retry, since a refusal that names
+# the act that lifts it invites the agent to take it. The restart is the user's
+# or host's to do, so the words say to report it.
+COORDINATOR_UNREACHABLE_RECOVER = GIVER_FENCED_RECOVER
+COORDINATOR_UNREACHABLE_NEXT_STEP = (
+    "Stop: this server got no usable answer from its coordinator, which is gone "
+    "or wedged, and the server cannot recover from that by itself. Do not write "
+    "the managed files by any other route. Report to your user or host that the "
+    "coordinator is gone and that they must restart this MCP server, stopping "
+    "the workspace's coordinator process first if the server will not start."
+)
+
 
 # Type A — matched by EXACT exception type (so a future subclass cannot silently
 # inherit a mapping). ``reason`` mirrors the constant carried on the exception
@@ -112,6 +132,12 @@ _TERMINALS: dict[type, _Terminal] = {
     # Both write routes raise it (swg_write's pre-edit, swg_write_cas's commit).
     GiverFenced: _Terminal(
         GiverFenced.reason, GIVER_FENCED_RECOVER, False, GIVER_FENCED_NEXT_STEP
+    ),
+    CoordinatorUnreachable: _Terminal(
+        CoordinatorUnreachable.reason,
+        COORDINATOR_UNREACHABLE_RECOVER,
+        False,
+        COORDINATOR_UNREACHABLE_NEXT_STEP,
     ),
 }
 
@@ -330,14 +356,17 @@ _CAS_TERMINALS: dict[str, _Terminal] = {
 # coordinator bug, for a state that is typed and the session's own.
 PRINCIPAL_REFUSED_RECOVER = "restart_session"
 
-# The refusal that is NOT settled: the request was refused, but the recovery
-# claim's answer was lost, so the volume adopted ``unconfirmed`` and its very
-# next request claims again with the same nonce by itself — the next tool call
-# may simply succeed, and ``swg_status`` reads ``principal_claim: unconfirmed``
+# The refusal that is NOT settled: the request was refused, and the recovery
+# claim was answered without binding (a redirect, an HTTP status, an
+# unconfirmed body), so the volume adopted ``unconfirmed`` and its very next
+# request claims again with the same nonce by itself — the next tool call may
+# simply succeed, and ``swg_status`` reads ``principal_claim: unconfirmed``
 # meanwhile. The verb is the existing one for "the state clears on its own,
 # call again" (``other_holder`` uses it), ``retryable`` true. Answering this arm
 # ``restart_session`` over-claimed durability: it sent the agent to a new
-# session for a state the next call cures.
+# session for a state the next call cures. A recovery claim that gets no answer
+# at all raises ``CoordinatorUnreachable`` on the strict volume and takes that
+# row's stop instead.
 PRINCIPAL_UNSETTLED_RECOVER = "wait_and_retry"
 
 # Fallback for any unrecognized exception (an unexpected ``CoherenceError`` such
@@ -499,9 +528,10 @@ def _giver_fields(exc: GiverFenced) -> dict:
 
 
 def coordinator_unavailable_result(detail: str) -> CallToolResult:
-    """Type B (synthesized): no adapter raised, but the volume is unattached or
-    the coordinator transport failed. Fail closed — the write is NOT
-    version-committed."""
+    """Type B (synthesized): no adapter raised, because the volume is
+    unattached. Fail closed — the write is NOT version-committed. A coordinator
+    that fails an attached strict volume arrives typed instead, as
+    ``CoordinatorUnreachable`` through its own row."""
     return _result(
         _Terminal(COORDINATOR_UNAVAILABLE_REASON, "retry_later", False),
         detail,
